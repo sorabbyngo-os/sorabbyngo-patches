@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0
+menu "Byngonet Network Identity"
+config BYNGONET_IDENTITY
+        tristate "Byngonet network identity layer"
+        select SORABBYNGO_NODEID
+        default m
+        help
+          Exposes Byngonet NodeID identity via /proc/byngonet_stats.
+          Netfilter hook will be re-enabled in v0.3 when stack is stable.
+          If unsure, say M.
+endmenu

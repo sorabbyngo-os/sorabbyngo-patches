@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0
+menu "Sorabbyngo AI OS Drivers"
+
+config SORABBYNGO_NODEID
+	tristate "Sorabbyngo NodeID hardware identity"
+	default m
+	help
+	  Hardware-bound cryptographic node identity for
+	  the Sorabbyngo AI OS. Required by Byngonet.
+	  If unsure, say M.
+
+source "drivers/sorabbyngo/byngonet/Kconfig"
+
+endmenu
