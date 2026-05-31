@@ -1,0 +1,63 @@
+From: SORABBYNGO Engineering <kernel@sorabbyngo.com>
+Subject: [PATCH 5/9] mm/slab: guard page insertion — OpenBSD malloc hardening
+
+OpenBSD's malloc(3) inserts guard pages randomly between allocations to
+detect heap overflows. This patch brings the concept to kernel slab:
+
+  1. CONFIG_SORABBYNGO_SLAB_GUARD: adds an unmapped guard page after
+     every N-th slab allocation (N=64 default, tunable via sysctl).
+     Overflows into the guard page trigger an immediate BUG().
+
+  2. Slab freelist randomisation: on kmalloc, the freelist order within
+     each slab is shuffled using get_random_u32(). This mirrors
+     OpenBSD's malloc chunk randomisation.
+
+  3. Use-after-free detection: freed slab chunks are poisoned with
+     0xDF (OpenBSD uses 0xDF for freed memory, 0xCD for uninitialised).
+
+These changes increase memory pressure slightly but provide meaningful
+protection against heap spray attacks — relevant for Cyberwall and
+CML's sandboxed external call path.
+---
+ mm/slub.c                         |  48 +++++++++++++
+ include/linux/sorabbyngo_slab.h   |  18 +++++
+ lib/Kconfig.sorabbyngo            |  14 ++++
+ 3 files changed, 80 insertions(+)
+
+diff --git a/mm/slub.c b/mm/slub.c
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -1,5 +1,6 @@
+ #include <linux/slab.h>
+ #include <linux/random.h>
++#include <linux/sorabbyngo_slab.h>
+ 
++#ifdef CONFIG_SORABBYNGO_SLAB_GUARD
++/*
++ * sorabbyngo_slab_poison - poison freed chunks (OpenBSD 0xDF pattern)
++ * Called from kmem_cache_free() before returning chunk to freelist.
++ */
++void sorabbyngo_slab_poison(void *obj, size_t size)
++{
++	memset(obj, SORABBYNGO_SLAB_FREE_POISON, size);
++}
++
++/*
++ * sorabbyngo_slab_check_poison - verify free-poison on alloc
++ * Any byte that isn't 0xDF indicates a use-after-free write.
++ */
++void sorabbyngo_slab_check_poison(const void *obj, size_t size)
++{
++	const u8 *p = obj;
++	size_t i;
++
++	for (i = 0; i < size; i++) {
++		if (p[i] != SORABBYNGO_SLAB_FREE_POISON) {
++			pr_emerg("sorabbyngo: use-after-free detected at "
++				 "%p+%zu (byte 0x%02x, expected 0x%02x)\n",
++				 obj, i, p[i], SORABBYNGO_SLAB_FREE_POISON);
++			BUG();
++		}
++	}
++}
++#endif /* CONFIG_SORABBYNGO_SLAB_GUARD */

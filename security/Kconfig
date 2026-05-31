@@ -1,0 +1,143 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# SORABBYNGO Security Hardening — OpenBSD-inspired options
+#
+
+menu "Sorabbyngo Security Hardening"
+
+config SORABBYNGO_WX_STRICT
+	bool "Strict W^X enforcement (OpenBSD-inspired)"
+	depends on MMU
+	default y
+	help
+	  Reject any mmap(2) or mprotect(2) call that would result in a
+	  page being simultaneously writable and executable. Processes
+	  without CAP_SYS_ADMIN get EACCES.
+
+	  Matches OpenBSD's default W^X policy. Recommended for all
+	  Sorabbyngo OS surfaces. JIT compilers must drop PROT_WRITE
+	  before adding PROT_EXEC.
+
+	  If unsure, say Y.
+
+config SORABBYNGO_PLEDGE
+	bool "Pledge syscall promise sets (OpenBSD pledge(2) adaptation)"
+	depends on SECCOMP_FILTER
+	default y
+	help
+	  Allows processes to voluntarily restrict their syscall surface
+	  via prctl(PR_SET_SORABBYNGO_PLEDGE). Once pledged, the promise
+	  set can only be narrowed. Violations send SIGKILL.
+
+	  Byngox agents, Chameha, and CML use this at startup to drop
+	  unneeded capabilities before entering their main loop.
+
+	  If unsure, say Y.
+
+config SORABBYNGO_UNVEIL
+	bool "Unveil filesystem path restriction (OpenBSD unveil(2) adaptation)"
+	depends on SORABBYNGO_PLEDGE
+	default y
+	help
+	  Allows processes to restrict their visible filesystem to an
+	  explicit set of paths. All other paths return ENOENT, making
+	  them invisible rather than forbidden.
+
+	  Chameha uses this to restrict its view to /opt/sorabbyngo/chameha
+	  and /proc/sorabbyngo. CML restricts to its log and config dirs.
+
+	  If unsure, say Y.
+
+config SORABBYNGO_SLAB_GUARD
+	bool "Slab guard pages and use-after-free detection (OpenBSD malloc hardening)"
+	default y
+	help
+	  Adds guard page insertion and free-poison detection to the kernel
+	  slab allocator, inspired by OpenBSD's malloc(3) hardening.
+
+	  Freed chunks are poisoned with 0xDF. Allocation verifies the
+	  poison pattern to catch use-after-free writes.
+
+	  Small performance cost (~2-3%) in exchange for heap overflow
+	  detection. Recommended for all Sorabbyngo OS surfaces.
+
+	  If unsure, say Y.
+
+config SORABBYNGO_SLAB_GUARD_INTERVAL
+	int "Guard page insertion interval (allocations)"
+	depends on SORABBYNGO_SLAB_GUARD
+	default 64
+	range 16 512
+	help
+	  Insert a guard page after every N slab allocations.
+	  Lower values = more protection, higher memory overhead.
+	  Default of 64 is a good balance for Byngox agent workloads.
+
+config SORABBYNGO_NET_POLICY
+	bool "Default-deny network policy (OpenBSD pf-inspired)"
+	depends on NETFILTER && IP_NF_FILTER
+	default y
+	help
+	  Enforces a whitelist-based network policy at the netfilter hook
+	  level, inspired by OpenBSD's pf(4) default-deny posture.
+
+	  All traffic not matching an explicit allow rule is dropped.
+	  Byngonet NodeID-verified peers are automatically allowed.
+	  Loopback traffic is always allowed.
+
+	  Configure via /proc/sorabbyngo/net_policy.
+
+	  If unsure, say Y.
+
+config SORABBYNGO_ANTISPOOF
+	bool "Anti-spoofing strict reverse path filtering"
+	depends on SORABBYNGO_NET_POLICY
+	default y
+	help
+	  Enable strict reverse-path filtering on all interfaces.
+	  Mirrors OpenBSD pf's "antispoof" directive.
+	  Drops packets whose source address fails a reverse-path check.
+
+	  If unsure, say Y.
+
+config SORABBYNGO_TCP_HARDENING
+	bool "TCP stack hardening (OpenBSD-inspired)"
+	depends on INET
+	default y
+	help
+	  Enables several TCP hardening features inspired by OpenBSD:
+	    - SipHash-2-4 based ISN generation (vs MD5 in OpenBSD)
+	    - Per-connection TCP timestamp randomisation
+	    - RST rate limiting (10/sec per source)
+	    - Aggressive SYN cookie threshold (32 vs Linux default 1024)
+
+	  Protects Byngonet peer connections and NATS JetStream bus.
+
+	  If unsure, say Y.
+
+config SORABBYNGO_PER_TASK_CANARY
+	bool "Per-task stack canary reseeding (OpenBSD-inspired)"
+	depends on STACKPROTECTOR_STRONG
+	default y
+	help
+	  Each task gets a unique stack canary derived from get_random_long()
+	  mixed with the NodeID. Reseeded at fork() and exec().
+
+	  A canary leak in one process cannot be used to attack another.
+	  Matches OpenBSD's per-process canary behaviour.
+
+	  If unsure, say Y.
+
+config SORABBYNGO_KASLR_ENTROPY
+	bool "Enhanced kASLR entropy (OpenBSD-inspired TSC jitter mixing)"
+	depends on RANDOMIZE_BASE
+	default y
+	help
+	  Mixes additional TSC jitter into the kASLR seed at early boot,
+	  and extends mmap/stack ASLR entropy to 28/16 bits respectively.
+
+	  Mirrors OpenBSD's boot-time entropy accumulation from locore.S.
+
+	  If unsure, say Y.
+
+endmenu

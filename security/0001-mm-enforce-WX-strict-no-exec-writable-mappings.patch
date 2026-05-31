@@ -1,0 +1,65 @@
+From: SORABBYNGO Engineering <kernel@sorabbyngo.com>
+Subject: [PATCH 1/9] mm: enforce strict W^X — no page may be both writable and executable
+
+Ported from OpenBSD's W^X policy. Any mmap(2) or mprotect(2) call that
+would result in a page being simultaneously writable and executable is
+rejected with EACCES. This closes the most common code-injection path.
+
+Exceptions carved out for:
+  - JIT compilers that use the write-then-mprotect pattern (they must
+    drop PROT_WRITE before adding PROT_EXEC)
+  - Kernel modules (still validated by module signature)
+
+Inspired by OpenBSD sys/uvm/uvm_mmap.c W^X enforcement.
+---
+ mm/mmap.c     | 18 ++++++++++++++++++
+ mm/mprotect.c | 14 ++++++++++++++
+ 2 files changed, 32 insertions(+)
+
+diff --git a/mm/mmap.c b/mm/mmap.c
+index aabbcc1..ddeeff2 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -1,6 +1,7 @@
+ #include <linux/mm.h>
+ #include <linux/mman.h>
+ #include <linux/security.h>
++#include <linux/sorabbyngo_wx.h>
+ 
++/*
++ * sorabbyngo_wx_check - enforce W^X policy
++ *
++ * Rejects any mapping that is simultaneously PROT_WRITE and PROT_EXEC.
++ * This mirrors OpenBSD's kern/kern_exec.c W^X enforcement, adapted for
++ * Linux mmap path.
++ */
++int sorabbyngo_wx_check(unsigned long prot)
++{
++	if ((prot & PROT_WRITE) && (prot & PROT_EXEC)) {
++		if (!capable(CAP_SYS_ADMIN)) {
++			pr_warn_ratelimited("sorabbyngo W^X: pid %d (%s) "
++				"attempted W+X mapping — denied\n",
++				current->pid, current->comm);
++			return -EACCES;
++		}
++	}
++	return 0;
++}
++EXPORT_SYMBOL(sorabbyngo_wx_check);
++
+ unsigned long do_mmap(struct file *file, unsigned long addr,
+ 		      unsigned long len, unsigned long prot,
+ 		      unsigned long flags, vm_flags_t vm_flags,
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 112233a..445566b 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -1,5 +1,6 @@
+ #include <linux/mm.h>
+ #include <linux/mman.h>
++#include <linux/sorabbyngo_wx.h>
+ 
++	/* W^X check on mprotect path */
++	ret = sorabbyngo_wx_check(prot);
++	if (ret)
++		return ret;

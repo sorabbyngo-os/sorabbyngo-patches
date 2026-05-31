@@ -1,0 +1,129 @@
+From: SORABBYNGO Engineering <kernel@sorabbyngo.com>
+Subject: [PATCH 3/9] vfs: add sorabbyngo unveil — per-process path restriction
+
+Linux adaptation of OpenBSD's unveil(2). After a process calls
+sorabbyngo_unveil() with a set of path/permission pairs, all VFS
+operations outside those paths are denied with ENOENT (not EPERM,
+matching OpenBSD's behaviour of making restricted paths invisible
+rather than explicitly forbidden).
+
+Permission flags:
+  'r' — read-only access
+  'w' — read-write access
+  'x' — execute (needed for loading shared libs)
+  'c' — create (needed for creating new files in the path)
+
+Integration points:
+  - Chameha calls unveil("/opt/sorabbyngo/chameha", "rwx") at boot
+  - Byngox agents unveil only their data dirs and /proc/sorabbyngo
+  - CML service unveils only /var/log/sorabbyngo/cml and /proc
+
+Inspired by OpenBSD sys/kern/kern_unveil.c
+---
+ include/linux/sorabbyngo_unveil.h |  38 +++++++++
+ kernel/sorabbyngo_unveil.c        | 120 +++++++++++++++++++++++++++
+ fs/namei.c                        |  10 +++
+ 3 files changed, 168 insertions(+)
+
+diff --git a/include/linux/sorabbyngo_unveil.h b/include/linux/sorabbyngo_unveil.h
+new file mode 100644
+index 0000000..cccabc1
+--- /dev/null
++++ b/include/linux/sorabbyngo_unveil.h
+@@ -0,0 +1,38 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_SORABBYNGO_UNVEIL_H
++#define _LINUX_SORABBYNGO_UNVEIL_H
++
++#define UNVEIL_READ    (1 << 0)
++#define UNVEIL_WRITE   (1 << 1)
++#define UNVEIL_EXEC    (1 << 2)
++#define UNVEIL_CREATE  (1 << 3)
++#define UNVEIL_MAX_ENTRIES 64
++
++struct unveil_entry {
++	char   path[PATH_MAX];
++	u8     perms;
++	bool   active;
++};
++
++int sorabbyngo_unveil(const char __user *path, const char __user *permissions);
++int sorabbyngo_unveil_check(const char *path, u8 required_perm);
++void sorabbyngo_unveil_lock(void);  /* freeze — no more unveil calls */
++
++#endif /* _LINUX_SORABBYNGO_UNVEIL_H */
+diff --git a/kernel/sorabbyngo_unveil.c b/kernel/sorabbyngo_unveil.c
+new file mode 100644
+index 0000000..dddbbc1
+--- /dev/null
++++ b/kernel/sorabbyngo_unveil.c
+@@ -0,0 +1,120 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * SORABBYNGO Unveil — per-process filesystem path restriction
++ *
++ * After unveil() is called, the process can only see paths explicitly
++ * unveiled. All other paths return ENOENT, making them invisible.
++ * Calling unveil(NULL, NULL) locks the unveil table.
++ *
++ * Reference: OpenBSD sys/kern/kern_unveil.c
++ */
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <linux/sched.h>
++#include <linux/path.h>
++#include <linux/namei.h>
++#include <linux/sorabbyngo_unveil.h>
++
++int sorabbyngo_unveil(const char __user *upath, const char __user *uperms)
++{
++	struct unveil_entry *table = current->sorabbyngo_unveil_table;
++	char path[PATH_MAX];
++	char perms[8];
++	int i, perm_flags = 0;
++
++	/* unveil(NULL, NULL) locks the table */
++	if (!upath && !uperms) {
++		current->sorabbyngo_unveil_locked = true;
++		return 0;
++	}
++
++	if (current->sorabbyngo_unveil_locked)
++		return -EPERM;
++
++	if (strncpy_from_user(path, upath, PATH_MAX) < 0)
++		return -EFAULT;
++	if (strncpy_from_user(perms, uperms, sizeof(perms)) < 0)
++		return -EFAULT;
++
++	/* Parse permission string */
++	for (i = 0; perms[i]; i++) {
++		switch (perms[i]) {
++		case 'r': perm_flags |= UNVEIL_READ;   break;
++		case 'w': perm_flags |= UNVEIL_WRITE;  break;
++		case 'x': perm_flags |= UNVEIL_EXEC;   break;
++		case 'c': perm_flags |= UNVEIL_CREATE; break;
++		}
++	}
++
++	if (!table) {
++		table = kzalloc(sizeof(*table) * UNVEIL_MAX_ENTRIES,
++				GFP_KERNEL);
++		if (!table)
++			return -ENOMEM;
++		current->sorabbyngo_unveil_table = table;
++		current->sorabbyngo_unveil_count = 0;
++	}
++
++	if (current->sorabbyngo_unveil_count >= UNVEIL_MAX_ENTRIES)
++		return -ENOMEM;
++
++	i = current->sorabbyngo_unveil_count++;
++	strscpy(table[i].path, path, PATH_MAX);
++	table[i].perms  = perm_flags;
++	table[i].active = true;
++
++	return 0;
++}
++EXPORT_SYMBOL(sorabbyngo_unveil);

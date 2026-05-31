@@ -1,0 +1,60 @@
+From: SORABBYNGO Engineering <kernel@sorabbyngo.com>
+Subject: [PATCH 7/9] stackprotector: per-task canary reseeding — OpenBSD-inspired
+
+OpenBSD reseed the stack canary on every exec(2) and at context switch
+boundaries (via a per-CPU canary updated in the interrupt handler).
+Linux uses a single global canary. This patch:
+
+  1. Adds a per-task canary stored in task_struct, initialised from
+     get_random_long() at fork() time.
+
+  2. On context switch (switch_to), loads the incoming task's canary
+     into the __stack_chk_guard memory location used by GCC's
+     -fstack-protector-strong.
+
+  3. On exec(), reseeds the new task's canary from fresh entropy.
+
+This means a canary leak in one process cannot be used to attack a
+different process — matching OpenBSD's per-process canary behaviour.
+
+NodeID is mixed into the canary seed so even identical processes on
+different Byngonet nodes have different canaries.
+---
+ arch/x86/include/asm/stackprotector.h |  28 +++++++
+ kernel/fork.c                         |  10 +++
+ fs/exec.c                             |   8 ++
+ arch/x86/kernel/process_64.c          |  16 ++++
+ 4 files changed, 62 insertions(+)
+
+diff --git a/arch/x86/include/asm/stackprotector.h b/arch/x86/include/asm/stackprotector.h
+--- a/arch/x86/include/asm/stackprotector.h
++++ b/arch/x86/include/asm/stackprotector.h
+@@ -1,5 +1,6 @@
+ #ifndef _ASM_X86_STACKPROTECTOR_H
+ #define _ASM_X86_STACKPROTECTOR_H
++#include <linux/random.h>
+ 
++/*
++ * sorabbyngo_init_task_canary - generate a per-task stack canary.
++ *
++ * Mixes NodeID into the canary so nodes with the same binary have
++ * different canaries. This mirrors OpenBSD's per-process canary
++ * seeded from arc4random() at fork time.
++ */
++static inline unsigned long sorabbyngo_init_task_canary(void)
++{
++	unsigned long canary = get_random_long();
++	extern char nodeid_hex[65];
++	u32 nodeid_word;
++
++	/* fold first 4 bytes of NodeID into canary */
++	memcpy(&nodeid_word, nodeid_hex, sizeof(u32));
++	canary ^= (unsigned long)nodeid_word;
++	canary ^= (unsigned long)nodeid_word << 32;
++
++	/* ensure low byte is never zero (GCC canary convention) */
++	if (!(canary & 0xff))
++		canary |= 0x42;
++
++	return canary;
++}
