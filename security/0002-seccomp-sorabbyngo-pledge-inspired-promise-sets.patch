@@ -1,0 +1,132 @@
+From: SORABBYNGO Engineering <kernel@sorabbyngo.com>
+Subject: [PATCH 2/9] seccomp: add sorabbyngo pledge-inspired promise sets
+
+Implements a Linux adaptation of OpenBSD's pledge(2). Processes declare
+their syscall intentions at startup via prctl(PR_SET_SORABBYNGO_PLEDGE).
+The kernel then enforces a seccomp-BPF filter corresponding to that
+promise set. Violations send SIGKILL (matching OpenBSD behaviour).
+
+Promise sets implemented:
+  stdio    — read, write, close, fstat, exit, sigreturn
+  rpath    — open(O_RDONLY), stat, lstat, fstatat, readlink
+  wpath    — open(O_WRONLY|O_CREAT), rename, unlink, mkdir
+  inet     — socket(AF_INET/AF_INET6), connect, bind, listen
+  dns      — socket(AF_INET), sendto, recvfrom, getaddrinfo helpers
+  proc     — fork, exec, wait4, getpid, getppid
+  id       — getuid, getgid, setuid, setgid
+  tty      — ioctl(TIOCGWINSZ), isatty helpers
+
+Byngox agents and Chameha use this at init time to drop unneeded
+capabilities before entering their main loop.
+
+Inspired by OpenBSD sys/kern/kern_pledge.c
+---
+ include/linux/sorabbyngo_pledge.h |  42 ++++++++++
+ kernel/sorabbyngo_pledge.c        | 140 ++++++++++++++++++++++++++++++
+ kernel/Makefile                   |   1 +
+ include/uapi/linux/prctl.h        |   3 +
+ kernel/sys.c                      |   6 ++
+ 5 files changed, 192 insertions(+)
+
+diff --git a/include/linux/sorabbyngo_pledge.h b/include/linux/sorabbyngo_pledge.h
+new file mode 100644
+index 0000000..aaabbb1
+--- /dev/null
++++ b/include/linux/sorabbyngo_pledge.h
+@@ -0,0 +1,42 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_SORABBYNGO_PLEDGE_H
++#define _LINUX_SORABBYNGO_PLEDGE_H
++
++#include <linux/types.h>
++
++/* Promise flags — OR these together */
++#define PLEDGE_STDIO   (1ULL << 0)
++#define PLEDGE_RPATH   (1ULL << 1)
++#define PLEDGE_WPATH   (1ULL << 2)
++#define PLEDGE_INET    (1ULL << 3)
++#define PLEDGE_DNS     (1ULL << 4)
++#define PLEDGE_PROC    (1ULL << 5)
++#define PLEDGE_ID      (1ULL << 6)
++#define PLEDGE_TTY     (1ULL << 7)
++#define PLEDGE_UNVEIL  (1ULL << 8)  /* may call sorabbyngo_unveil */
++#define PLEDGE_ALL     ((1ULL << 9) - 1)
++
++int sorabbyngo_pledge(u64 promises);
++int sorabbyngo_pledge_check(int syscall_nr);
++
++#endif /* _LINUX_SORABBYNGO_PLEDGE_H */
+diff --git a/kernel/sorabbyngo_pledge.c b/kernel/sorabbyngo_pledge.c
+new file mode 100644
+index 0000000..bbbbcc1
+--- /dev/null
++++ b/kernel/sorabbyngo_pledge.c
+@@ -0,0 +1,140 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * SORABBYNGO Pledge — Linux adaptation of OpenBSD pledge(2)
++ *
++ * Processes voluntarily restrict their syscall surface. Once pledged,
++ * the promise set can only be narrowed, never widened. Violations
++ * result in SIGKILL (matching OpenBSD semantics).
++ *
++ * Reference: OpenBSD sys/kern/kern_pledge.c
++ */
++#include <linux/kernel.h>
++#include <linux/sched.h>
++#include <linux/signal.h>
++#include <linux/syscalls.h>
++#include <linux/prctl.h>
++#include <linux/sorabbyngo_pledge.h>
++#include <linux/seccomp.h>
++#include <linux/filter.h>
++
++/* Per-process pledge state stored in task_struct via prctl */
++static DEFINE_PER_CPU(u64, current_pledge_mask);
++
++/*
++ * Syscall allowlists per promise.
++ * These are conservative — byngox agents call sorabbyngo_pledge() at
++ * startup with only the promises they actually need.
++ */
++static const int stdio_syscalls[] = {
++	__NR_read, __NR_write, __NR_close, __NR_fstat,
++	__NR_exit, __NR_exit_group, __NR_rt_sigreturn,
++	__NR_poll, __NR_ppoll, __NR_select, __NR_pselect6,
++	__NR_mmap, __NR_munmap, __NR_brk,
++	-1
++};
++
++static const int rpath_syscalls[] = {
++	__NR_open, __NR_openat, __NR_stat, __NR_lstat,
++	__NR_fstat, __NR_fstatat, __NR_readlink, __NR_readlinkat,
++	__NR_getdents64, __NR_access, __NR_faccessat,
++	-1
++};
++
++static const int inet_syscalls[] = {
++	__NR_socket, __NR_connect, __NR_bind, __NR_listen,
++	__NR_accept, __NR_accept4, __NR_sendto, __NR_recvfrom,
++	__NR_setsockopt, __NR_getsockopt, __NR_shutdown,
++	-1
++};
++
++int sorabbyngo_pledge(u64 promises)
++{
++	u64 current_mask = current->sorabbyngo_pledge;
++
++	/* Pledge is a one-way ratchet — can only narrow, never widen */
++	if (current_mask && (promises & ~current_mask)) {
++		pr_warn("sorabbyngo pledge: pid %d attempted to widen promises"
++			" (0x%llx -> 0x%llx) — SIGKILL\n",
++			current->pid, current_mask, promises);
++		send_sig(SIGKILL, current, 0);
++		return -EPERM;
++	}
++
++	current->sorabbyngo_pledge = promises;
++	pr_info("sorabbyngo pledge: pid %d (%s) pledged 0x%llx\n",
++		current->pid, current->comm, promises);
++	return 0;
++}
++EXPORT_SYMBOL(sorabbyngo_pledge);

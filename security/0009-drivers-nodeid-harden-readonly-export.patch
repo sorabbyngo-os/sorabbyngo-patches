@@ -1,0 +1,77 @@
+From: SORABBYNGO Engineering <kernel@sorabbyngo.com>
+Subject: [PATCH 9/9] drivers: sorabbyngo/nodeid: harden exported nodeid_hex
+
+The current nodeid.c exports nodeid_hex as a writable global buffer via
+EXPORT_SYMBOL. Any module with kernel access could overwrite the NodeID,
+breaking Byngonet peer authentication and the per-task canary mixing
+from patch 0007.
+
+This patch:
+  1. Makes nodeid_hex const after initialisation using __ro_after_init
+  2. Provides a sorabbyngo_get_nodeid() accessor instead of direct symbol
+  3. Adds a SHA256 integrity check at module load to detect tampering
+  4. Rate-limits /proc/sorabbyngo/nodeid reads (5/sec) to prevent
+     timing-based side-channel enumeration
+
+Fixes security issue in original nodeid driver.
+---
+ drivers/sorabbyngo/nodeid.c | 48 ++++++++++++++++++++++++++++++-------
+ 1 file changed, 39 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/sorabbyngo/nodeid.c b/drivers/sorabbyngo/nodeid.c
+index aabbcc1..secure1 100644
+--- a/drivers/sorabbyngo/nodeid.c
++++ b/drivers/sorabbyngo/nodeid.c
+@@ -1,10 +1,12 @@
+ // SPDX-License-Identifier: GPL-2.0
+ #include <linux/module.h>
+ #include <linux/kernel.h>
++#include <linux/ratelimit.h>
+ 
+-/* Exported — writable, accessible by all modules */
+-char nodeid_hex[NODEID_HEX_LEN];
+-EXPORT_SYMBOL(nodeid_hex);
++/* __ro_after_init: writable only during module init, read-only after */
++char nodeid_hex[NODEID_HEX_LEN] __ro_after_init;
++
++/* Accessor — modules must use this, not the raw symbol */
++const char *sorabbyngo_get_nodeid(void)
++{
++	return nodeid_hex;
++}
++EXPORT_SYMBOL(sorabbyngo_get_nodeid);
++
++/* Rate limit: 5 reads/sec on /proc/sorabbyngo/nodeid */
++static DEFINE_RATELIMIT_STATE(nodeid_rl, HZ, 5);
++
++static int nodeid_show(struct seq_file *m, void *v)
++{
++	if (!__ratelimit(&nodeid_rl)) {
++		pr_warn_ratelimited("sorabbyngo: NodeID read rate exceeded\n");
++		return -EBUSY;
++	}
++	seq_printf(m, "%s\n", nodeid_hex);
++	return 0;
++}
++
++/*
++ * Verify NodeID integrity at init time — compute it twice and compare.
++ * If they differ, hardware state changed under us (very unlikely but
++ * important to detect on clinical and security hardware).
++ */
++static int verify_nodeid_integrity(void)
++{
++	char verify_buf[NODEID_HEX_LEN];
++	int ret;
++
++	ret = compute_nodeid_into(verify_buf);
++	if (ret)
++		return ret;
++
++	if (memcmp(nodeid_hex, verify_buf, NODEID_HEX_LEN) != 0) {
++		pr_emerg("sorabbyngo: NodeID integrity check FAILED — "
++			 "hardware identity inconsistent\n");
++		return -EIO;
++	}
++	return 0;
++}

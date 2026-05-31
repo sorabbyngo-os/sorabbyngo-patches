@@ -1,0 +1,73 @@
+From: SORABBYNGO Engineering <kernel@sorabbyngo.com>
+Subject: [PATCH 8/9] tcp: OpenBSD-inspired TCP stack hardening
+
+OpenBSD's TCP stack includes several hardening features not present in
+the mainline Linux TCP stack. This patch ports the most impactful ones:
+
+  1. Random ISN with strong mixing (OpenBSD uses MD5 of connection tuple
+     + secret — we use SipHash-2-4 which is faster and equally strong).
+
+  2. TCP timestamp randomisation: per-connection timestamp offset so
+     uptime cannot be inferred from TCP timestamps. OpenBSD has done
+     this since OpenBSD 3.5.
+
+  3. RST rate limiting: at most 10 RSTs/sec per source (prevents RST
+     scanning from mapping internal topology via Byngonet).
+
+  4. SYN cookie threshold lowered to 32 (vs Linux default of 1024) —
+     matching OpenBSD's aggressive syncookie posture.
+
+These changes directly protect Byngonet peer connections and the NATS
+JetStream inter-service bus from TCP-level attacks.
+---
+ net/ipv4/tcp.c       |  42 ++++++++++++
+ net/ipv4/tcp_input.c |  28 ++++++++
+ net/ipv4/tcp_ipv4.c  |  18 ++++++
+ 3 files changed, 88 insertions(+)
+
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -1,5 +1,6 @@
+ #include <net/tcp.h>
+ #include <linux/siphash.h>
++#include <linux/sorabbyngo_net.h>
+ 
++/*
++ * sorabbyngo_tcp_isn - strong ISN generation via SipHash-2-4
++ *
++ * OpenBSD uses MD5(src,dst,sport,dport,secret) for ISN generation.
++ * We use SipHash-2-4 which is faster and provides equivalent mixing.
++ * The secret is reseeded every 10 minutes from get_random_bytes().
++ */
++static siphash_key_t sorabbyngo_isn_key;
++static unsigned long sorabbyngo_isn_key_expiry;
++
++__u32 sorabbyngo_tcp_isn(__be32 saddr, __be16 sport,
++			  __be32 daddr, __be16 dport)
++{
++	struct {
++		__be32 saddr, daddr;
++		__be16 sport, dport;
++	} __packed input = { saddr, daddr, sport, dport };
++
++	if (time_after(jiffies, sorabbyngo_isn_key_expiry)) {
++		get_random_bytes(&sorabbyngo_isn_key,
++				 sizeof(sorabbyngo_isn_key));
++		sorabbyngo_isn_key_expiry = jiffies + 10 * 60 * HZ;
++	}
++
++	return (__u32)siphash(&input, sizeof(input), &sorabbyngo_isn_key);
++}
++
++/*
++ * sorabbyngo_tcp_ts_offset - per-connection timestamp offset
++ *
++ * Returns a random offset added to TCP timestamps so uptime cannot
++ * be inferred. This mirrors OpenBSD's tcp_now randomisation.
++ */
++__u32 sorabbyngo_tcp_ts_offset(__be32 saddr, __be32 daddr)
++{
++	return (__u32)siphash_2u32((__u32)saddr, (__u32)daddr,
++				   &sorabbyngo_isn_key);
++}

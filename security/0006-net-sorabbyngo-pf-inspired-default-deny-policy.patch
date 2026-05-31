@@ -1,0 +1,150 @@
+From: SORABBYNGO Engineering <kernel@sorabbyngo.com>
+Subject: [PATCH 6/9] net: sorabbyngo default-deny network policy — pf-inspired
+
+OpenBSD's pf(4) defaults to blocking all traffic until explicit pass
+rules are added. This patch adds a Sorabbyngo-specific netfilter hook
+that implements the same philosophy at the kernel level:
+
+  - Default policy: DROP on INPUT and FORWARD chains
+  - Loopback traffic: always allow (matches pf "pass quick on lo0")
+  - NodeID-verified Byngonet traffic: allowed via
+    /proc/sorabbyngo/net_policy
+  - Rate limiting: new connection rate limited to 50/s per source IP
+    (mirrors pf's "max-src-conn-rate" option)
+  - TCP SYN cookie enforcement regardless of backlog size (OpenBSD
+    enables syncookies unconditionally)
+  - IP source validation: strict reverse-path filtering on all
+    interfaces (matches pf "antispoof")
+
+sysctl knobs:
+  net.sorabbyngo.default_policy    0=allow 1=deny (default: 1)
+  net.sorabbyngo.syn_rate_limit    new SYNs/sec (default: 50)
+  net.sorabbyngo.antispoof         0/1 (default: 1)
+---
+ net/sorabbyngo/Kconfig            |  12 +++
+ net/sorabbyngo/Makefile           |   3 +
+ net/sorabbyngo/net_policy.c       | 180 ++++++++++++++++++++++++++++++
+ include/linux/sorabbyngo_net.h    |  32 ++++++
+ net/ipv4/tcp_input.c              |   6 ++
+ net/ipv4/fib_frontend.c           |   4 ++
+ 6 files changed, 237 insertions(+)
+
+diff --git a/net/sorabbyngo/net_policy.c b/net/sorabbyngo/net_policy.c
+new file mode 100644
+index 0000000..eeecbd1
+--- /dev/null
++++ b/net/sorabbyngo/net_policy.c
+@@ -0,0 +1,180 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * SORABBYNGO Network Policy — pf-inspired default-deny filtering
++ *
++ * Enforces a whitelist-based network policy at the netfilter hook level.
++ * All traffic not matching an explicit allow rule is dropped.
++ *
++ * Reference: OpenBSD sys/net/pf.c, sys/net/pf_norm.c
++ */
++#include <linux/netfilter.h>
++#include <linux/netfilter_ipv4.h>
++#include <linux/ip.h>
++#include <linux/tcp.h>
++#include <linux/spinlock.h>
++#include <linux/jhash.h>
++#include <linux/ratelimit.h>
++#include <net/ip.h>
++#include <linux/sorabbyngo_net.h>
++
++static int sorabbyngo_default_policy __read_mostly = 1; /* 1 = deny */
++static int sorabbyngo_syn_rate_limit __read_mostly  = 50;
++static int sorabbyngo_antispoof     __read_mostly   = 1;
++
++/* Per-source SYN rate tracking (simple token bucket) */
++#define SYN_BUCKET_COUNT 1024
++static atomic_t syn_buckets[SYN_BUCKET_COUNT];
++static unsigned long syn_last_reset;
++
++static unsigned int sorabbyngo_net_hook(void *priv,
++					struct sk_buff *skb,
++					const struct nf_hook_state *state)
++{
++	struct iphdr *iph;
++	struct tcphdr *tcph;
++	u32 bucket;
++
++	/* Always pass loopback — matches pf "pass quick on lo0" */
++	if (skb->dev && (skb->dev->flags & IFF_LOOPBACK))
++		return NF_ACCEPT;
++
++	if (!sorabbyngo_default_policy)
++		return NF_ACCEPT;
++
++	iph = ip_hdr(skb);
++	if (!iph)
++		return NF_DROP;
++
++	/* Antispoof: drop packets with source matching our own addresses */
++	if (sorabbyngo_antispoof) {
++		if (fib_validate_source(skb, iph->saddr, iph->daddr,
++					RT_TOS(iph->tos),
++					state->in->ifindex,
++					state->net, NULL) < 0) {
++			pr_warn_ratelimited("sorabbyngo antispoof: dropping "
++					    "spoofed packet from %pI4\n",
++					    &iph->saddr);
++			return NF_DROP;
++		}
++	}
++
++	/* SYN rate limiting */
++	if (iph->protocol == IPPROTO_TCP) {
++		tcph = tcp_hdr(skb);
++		if (tcph && tcph->syn && !tcph->ack) {
++			/* reset buckets every second */
++			if (time_after(jiffies, syn_last_reset + HZ)) {
++				int i;
++				for (i = 0; i < SYN_BUCKET_COUNT; i++)
++					atomic_set(&syn_buckets[i], 0);
++				syn_last_reset = jiffies;
++			}
++			bucket = jhash_1word(iph->saddr, 0xdeadbeef)
++				 % SYN_BUCKET_COUNT;
++			if (atomic_inc_return(&syn_buckets[bucket])
++			    > sorabbyngo_syn_rate_limit) {
++				return NF_DROP;
++			}
++		}
++	}
++
++	/* Check against NodeID-verified Byngonet allowlist */
++	if (sorabbyngo_net_is_byngonet_peer(iph->saddr))
++		return NF_ACCEPT;
++
++	/* Default deny */
++	return NF_DROP;
++}
++
++static struct nf_hook_ops sorabbyngo_nf_ops[] = {
++	{
++		.hook     = sorabbyngo_net_hook,
++		.pf       = NFPROTO_IPV4,
++		.hooknum  = NF_INET_PRE_ROUTING,
++		.priority = NF_IP_PRI_FIRST,
++	},
++};
++
++static int __init sorabbyngo_net_policy_init(void)
++{
++	int ret;
++	spin_lock_init(&sorabbyngo_net_lock);
++	ret = nf_register_net_hooks(&init_net, sorabbyngo_nf_ops,
++				    ARRAY_SIZE(sorabbyngo_nf_ops));
++	if (ret)
++		pr_err("sorabbyngo net_policy: failed to register hooks: %d\n",
++		       ret);
++	else
++		pr_info("sorabbyngo net_policy: default-deny active "
++			"(syn_limit=%d antispoof=%d)\n",
++			sorabbyngo_syn_rate_limit, sorabbyngo_antispoof);
++	return ret;
++}
++module_init(sorabbyngo_net_policy_init);

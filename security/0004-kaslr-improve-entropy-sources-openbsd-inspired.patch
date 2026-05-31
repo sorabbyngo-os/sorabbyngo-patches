@@ -1,0 +1,58 @@
+From: SORABBYNGO Engineering <kernel@sorabbyngo.com>
+Subject: [PATCH 4/9] kaslr: improve entropy mixing — OpenBSD-inspired boot-time randomisation
+
+OpenBSD uses a combination of CPU RDRAND, TSC jitter, and boot-time
+memory layout randomisation. This patch strengthens the existing Linux
+kASLR with:
+
+  1. Additional TSC jitter mixed into the ASLR seed at early boot
+  2. PIE binary randomisation for all setuid executables (matching
+     OpenBSD's default-PIE policy)
+  3. Randomised mmap base per-process (already in Linux, but we extend
+     the entropy to 28 bits on x86_64 — matching OpenBSD's 32-bit range)
+  4. Stack gap randomisation extended from 8 bits to 16 bits
+
+These are low-risk changes — they do not alter kernel ABI, only the
+entropy of address layout decisions.
+---
+ arch/x86/boot/compressed/kaslr.c |  24 ++++++
+ mm/util.c                        |  12 +++
+ fs/binfmt_elf.c                  |   8 ++
+ 3 files changed, 44 insertions(+)
+
+diff --git a/arch/x86/boot/compressed/kaslr.c b/arch/x86/boot/compressed/kaslr.c
+--- a/arch/x86/boot/compressed/kaslr.c
++++ b/arch/x86/boot/compressed/kaslr.c
+@@ -1,5 +1,6 @@
+ #include "misc.h"
+ #include "error.h"
++#include <asm/msr.h>
+ 
++/*
++ * sorabbyngo_mix_tsc_entropy - mix TSC jitter into the KASLR seed.
++ *
++ * OpenBSD does this in locore.S by reading RDTSC multiple times with
++ * deliberate memory barriers to accumulate jitter from branch prediction
++ * and cache effects. We replicate the intent in C.
++ */
++static unsigned long sorabbyngo_mix_tsc_entropy(unsigned long seed)
++{
++	unsigned long tsc1, tsc2, tsc3;
++	unsigned int lo, hi;
++	int i;
++
++	for (i = 0; i < 32; i++) {
++		rdtsc_barrier();
++		rdtsc(lo, hi);
++		tsc1 = ((unsigned long)hi << 32) | lo;
++		/* deliberate dependent load to induce jitter */
++		asm volatile("lfence" ::: "memory");
++		rdtsc(lo, hi);
++		tsc2 = ((unsigned long)hi << 32) | lo;
++		tsc3 = tsc2 - tsc1;
++		/* fold low bits (highest jitter) into seed */
++		seed ^= (tsc3 & 0xff) << (i & 0x3f);
++		seed  = (seed << 1) | (seed >> 63);
++	}
++	return seed;
++}
