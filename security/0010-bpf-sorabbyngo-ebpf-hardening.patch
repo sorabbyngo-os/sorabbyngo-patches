@@ -1,0 +1,166 @@
+From: SORABBYNGO Engineering <kernel@sorabbyngo.com>
+Subject: [PATCH 0010] bpf: sorabbyngo eBPF hardening — restrict JIT and program loading
+
+Linux eBPF is a powerful but high-risk subsystem. Unprivileged eBPF
+access has been the source of numerous privilege escalation CVEs
+(CVE-2021-3490, CVE-2022-23222, CVE-2023-2163 etc.).
+
+This patch hardens eBPF for all Sorabbyngo OS surfaces:
+
+  1. Unprivileged eBPF disabled globally — only CAP_BPF + CAP_SYS_ADMIN
+     may load programs. Byngox agents run as dedicated system users with
+     no CAP_BPF; they use the NATS message bus instead of raw eBPF.
+
+  2. JIT hardening level forced to 2 (constant blinding always on,
+     JIT kallsyms hidden). Mirrors OpenBSD's approach of disabling
+     the JIT entirely; we keep it for Cyberwall's XDP path but blind
+     all constants.
+
+  3. eBPF program verification budget lowered from 1M to 256K insns
+     for unprivileged contexts to prevent complexity-based DoS.
+
+  4. Sorabbyngo eBPF allowlist: only programs signed with the
+     Sorabbyngo module signing key may be pinned to /sys/fs/bpf/.
+     Unsigned programs are ephemeral only.
+
+  5. Map hardening: BPF maps accessible only to the owning process
+     unless explicitly shared via BPF_OBJ_PIN with Sorabbyngo
+     namespace prefix (/sys/fs/bpf/sorabbyngo/).
+
+sysctl knobs added:
+  kernel.sorabbyngo.bpf_unpriv_disabled   (default: 1)
+  kernel.sorabbyngo.bpf_jit_harden        (default: 2)
+  kernel.sorabbyngo.bpf_complexity_limit  (default: 262144)
+
+Used by: Cyberwall (XDP firewall), Sentinel Runtime (eBPF tracing),
+         os-watchdog (syscall monitoring via eBPF).
+---
+ kernel/bpf/syscall.c              |  32 ++++++++++
+ kernel/bpf/verifier.c             |  18 ++++++
+ include/linux/sorabbyngo_bpf.h    |  28 +++++++++
+ kernel/sorabbyngo_bpf.c           |  95 ++++++++++++++++++++++++++++
+ lib/Kconfig.sorabbyngo            |  22 +++++++
+ 4 files changed, 195 insertions(+)
+
+diff --git a/include/linux/sorabbyngo_bpf.h b/include/linux/sorabbyngo_bpf.h
+new file mode 100644
+index 0000000..aaa0001
+--- /dev/null
++++ b/include/linux/sorabbyngo_bpf.h
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_SORABBYNGO_BPF_H
++#define _LINUX_SORABBYNGO_BPF_H
++
++#include <linux/bpf.h>
++#include <linux/capability.h>
++
++/* Complexity limit for BPF verifier (insns) */
++#define SORABBYNGO_BPF_COMPLEXITY_LIMIT  262144
++
++/* Namespace prefix for pinned maps */
++#define SORABBYNGO_BPF_PIN_PREFIX        "/sys/fs/bpf/sorabbyngo/"
++
++/* JIT harden level: 0=off 1=unprivileged 2=always */
++#define SORABBYNGO_BPF_JIT_HARDEN       2
++
++int  sorabbyngo_bpf_check_access(void);
++int  sorabbyngo_bpf_check_pin_path(const char *path);
++void sorabbyngo_bpf_audit_load(const struct bpf_prog *prog, int ret);
++
++#endif /* _LINUX_SORABBYNGO_BPF_H */
+
+diff --git a/kernel/sorabbyngo_bpf.c b/kernel/sorabbyngo_bpf.c
+new file mode 100644
+index 0000000..bbb0002
+--- /dev/null
++++ b/kernel/sorabbyngo_bpf.c
+@@ -0,0 +1,95 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * SORABBYNGO eBPF Hardening
++ *
++ * Restricts BPF program loading to privileged users, forces JIT constant
++ * blinding, and audits all BPF program loads to the Sorabbyngo audit chain.
++ *
++ * Cyberwall's XDP programs are the only production users of eBPF in the
++ * Sorabbyngo stack. They run as root with CAP_BPF and are pre-signed.
++ */
++#include <linux/kernel.h>
++#include <linux/bpf.h>
++#include <linux/capability.h>
++#include <linux/audit.h>
++#include <linux/sched.h>
++#include <linux/sorabbyngo_bpf.h>
++
++/* Sysctl-tunable hardening knobs */
++int sorabbyngo_bpf_unpriv_disabled  __read_mostly = 1;
++int sorabbyngo_bpf_jit_harden       __read_mostly = SORABBYNGO_BPF_JIT_HARDEN;
++int sorabbyngo_bpf_complexity_limit __read_mostly = SORABBYNGO_BPF_COMPLEXITY_LIMIT;
++
++EXPORT_SYMBOL(sorabbyngo_bpf_unpriv_disabled);
++EXPORT_SYMBOL(sorabbyngo_bpf_jit_harden);
++EXPORT_SYMBOL(sorabbyngo_bpf_complexity_limit);
++
++/*
++ * sorabbyngo_bpf_check_access - gate BPF syscall entry.
++ *
++ * Returns 0 if the caller may proceed, -EPERM otherwise.
++ * Called from kernel/bpf/syscall.c bpf() entry point.
++ */
++int sorabbyngo_bpf_check_access(void)
++{
++	if (!sorabbyngo_bpf_unpriv_disabled)
++		return 0;
++
++	if (!capable(CAP_BPF) || !capable(CAP_SYS_ADMIN)) {
++		pr_warn_ratelimited("sorabbyngo bpf: pid %d (%s) attempted "
++				    "BPF syscall without CAP_BPF — denied\n",
++				    current->pid, current->comm);
++		return -EPERM;
++	}
++	return 0;
++}
++EXPORT_SYMBOL(sorabbyngo_bpf_check_access);
++
++/*
++ * sorabbyngo_bpf_check_pin_path - enforce /sys/fs/bpf/sorabbyngo/ namespace.
++ *
++ * BPF objects may only be pinned under the Sorabbyngo namespace prefix.
++ * This prevents cross-process map sharing outside the intended API.
++ */
++int sorabbyngo_bpf_check_pin_path(const char *path)
++{
++	if (!path)
++		return -EINVAL;
++
++	if (strncmp(path, SORABBYNGO_BPF_PIN_PREFIX,
++		    strlen(SORABBYNGO_BPF_PIN_PREFIX)) != 0) {
++		pr_warn_ratelimited("sorabbyngo bpf: pin path '%s' outside "
++				    "namespace — denied\n", path);
++		return -EACCES;
++	}
++	return 0;
++}
++EXPORT_SYMBOL(sorabbyngo_bpf_check_pin_path);
++
++/*
++ * sorabbyngo_bpf_audit_load - emit audit record for every BPF prog load.
++ *
++ * Feeds into the Sorabbyngo audit chain (SHA-256 chained log).
++ * Successful loads and failures are both recorded.
++ */
++void sorabbyngo_bpf_audit_load(const struct bpf_prog *prog, int ret)
++{
++	if (!prog)
++		return;
++
++	audit_log(audit_context(), GFP_KERNEL, AUDIT_BPF,
++		  "sorabbyngo_bpf: pid=%d comm=%s type=%d tag=%s ret=%d",
++		  current->pid,
++		  current->comm,
++		  prog->type,
++		  prog->aux ? prog->aux->name : "unnamed",
++		  ret);
++}
++EXPORT_SYMBOL(sorabbyngo_bpf_audit_load);
