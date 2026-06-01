@@ -2,8 +2,13 @@
 /*
  * SORABBYNGO NodeID — Hardware-bound cryptographic node identity
  * Author: SORABBYNGO Engineering
+ *
+ * Security hardening (patch 0009):
+ *   - nodeid_hex is __ro_after_init (read-only after module init)
+ *   - sorabbyngo_get_nodeid() accessor replaces direct symbol export
+ *   - /proc read rate-limited to 5/sec
+ *   - Double-compute integrity check at init
  */
-
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -13,6 +18,7 @@
 #include <linux/netdevice.h>
 #include <linux/if_arp.h>
 #include <linux/rcupdate.h>
+#include <linux/ratelimit.h>
 #include <crypto/hash.h>
 #include <asm/cpufeature.h>
 
@@ -20,137 +26,187 @@
 #define SORABBYNGO_NODEID_FILE  "nodeid"
 #define NODEID_HEX_LEN          65
 
-/* Exported — accessible by byngonet and other SORABBYNGO modules */
-char nodeid_hex[NODEID_HEX_LEN];
-EXPORT_SYMBOL(nodeid_hex);
+/*
+ * __ro_after_init: kernel marks this page read-only after init completes.
+ * No module can write to nodeid_hex after sorabbyngo_nodeid_init() returns.
+ * Use sorabbyngo_get_nodeid() to read it.
+ */
+char nodeid_hex[NODEID_HEX_LEN] __ro_after_init;
+
+/*
+ * sorabbyngo_get_nodeid - safe read-only accessor for the NodeID.
+ * All modules (byngonet, citadel, CML) must use this instead of
+ * directly referencing nodeid_hex.
+ */
+const char *sorabbyngo_get_nodeid(void)
+{
+	return nodeid_hex;
+}
+EXPORT_SYMBOL(sorabbyngo_get_nodeid);
+
+/* Rate limit: 5 reads/sec on /proc/sorabbyngo/nodeid */
+static DEFINE_RATELIMIT_STATE(nodeid_rl, HZ, 5);
 
 static struct proc_dir_entry *sorabbyngo_proc_dir;
 
 static void get_cpu_id(u8 *buf, size_t len)
 {
-        u32 eax = 1, ebx = 0, ecx = 0, edx = 0;
-        cpuid(1, &eax, &ebx, &ecx, &edx);
-        memcpy(buf,     &eax, sizeof(u32));
-        memcpy(buf + 4, &edx, sizeof(u32));
+	u32 eax = 1, ebx = 0, ecx = 0, edx = 0;
+
+	cpuid(1, &eax, &ebx, &ecx, &edx);
+	memcpy(buf,     &eax, sizeof(u32));
+	memcpy(buf + 4, &edx, sizeof(u32));
 }
 
 static int get_primary_mac(u8 *mac_buf)
 {
-        struct net_device *dev;
-        int found = 0;
+	struct net_device *dev;
+	int found = 0;
 
-        rcu_read_lock();
-        for_each_netdev_rcu(&init_net, dev) {
-                if (dev->type == ARPHRD_ETHER &&
-                    !(dev->flags & IFF_LOOPBACK)) {
-                        memcpy(mac_buf, dev->dev_addr, ETH_ALEN);
-                        found = 1;
-                        break;
-                }
-        }
-        rcu_read_unlock();
-        return found;
+	rcu_read_lock();
+	for_each_netdev_rcu(&init_net, dev) {
+		if (dev->type == ARPHRD_ETHER &&
+		    !(dev->flags & IFF_LOOPBACK)) {
+			memcpy(mac_buf, dev->dev_addr, ETH_ALEN);
+			found = 1;
+			break;
+		}
+	}
+	rcu_read_unlock();
+	return found;
 }
 
-static int compute_nodeid(void)
+/*
+ * compute_nodeid_into - compute NodeID into a caller-supplied buffer.
+ * Used both for init and for the integrity double-check.
+ */
+static int compute_nodeid_into(char *out)
 {
-        struct crypto_shash *tfm;
-        struct shash_desc *desc;
-        u8 cpu_buf[8];
-        u8 mac_buf[ETH_ALEN];
-        u8 hash[32];
-        int ret, i;
+	struct crypto_shash *tfm;
+	struct shash_desc *desc;
+	u8 cpu_buf[8];
+	u8 mac_buf[ETH_ALEN];
+	u8 hash[32];
+	int ret, i;
 
-        if (!get_primary_mac(mac_buf)) {
-                pr_warn("sorabbyngo: no ethernet device, using zeros\n");
-                memset(mac_buf, 0, ETH_ALEN);
-        }
+	if (!get_primary_mac(mac_buf)) {
+		pr_warn("sorabbyngo: no ethernet device, using zeros\n");
+		memset(mac_buf, 0, ETH_ALEN);
+	}
+	get_cpu_id(cpu_buf, sizeof(cpu_buf));
 
-        get_cpu_id(cpu_buf, sizeof(cpu_buf));
+	tfm = crypto_alloc_shash("sha256", 0, 0);
+	if (IS_ERR(tfm))
+		return PTR_ERR(tfm);
 
-        tfm = crypto_alloc_shash("sha256", 0, 0);
-        if (IS_ERR(tfm))
-                return PTR_ERR(tfm);
+	desc = kzalloc(sizeof(*desc) + crypto_shash_descsize(tfm),
+		       GFP_KERNEL);
+	if (!desc) {
+		crypto_free_shash(tfm);
+		return -ENOMEM;
+	}
+	desc->tfm = tfm;
 
-        desc = kzalloc(sizeof(*desc) + crypto_shash_descsize(tfm),
-                       GFP_KERNEL);
-        if (!desc) {
-                crypto_free_shash(tfm);
-                return -ENOMEM;
-        }
+	ret = crypto_shash_init(desc);
+	if (ret) goto out;
+	ret = crypto_shash_update(desc, cpu_buf, sizeof(cpu_buf));
+	if (ret) goto out;
+	ret = crypto_shash_update(desc, mac_buf, ETH_ALEN);
+	if (ret) goto out;
+	ret = crypto_shash_final(desc, hash);
+	if (ret) goto out;
 
-        desc->tfm = tfm;
-        ret = crypto_shash_init(desc);
-        if (ret) goto out;
-        ret = crypto_shash_update(desc, cpu_buf, sizeof(cpu_buf));
-        if (ret) goto out;
-        ret = crypto_shash_update(desc, mac_buf, ETH_ALEN);
-        if (ret) goto out;
-        ret = crypto_shash_final(desc, hash);
-        if (ret) goto out;
-
-        for (i = 0; i < 32; i++)
-                sprintf(&nodeid_hex[i * 2], "%02x", hash[i]);
-        nodeid_hex[64] = '\0';
+	for (i = 0; i < 32; i++)
+		sprintf(&out[i * 2], "%02x", hash[i]);
+	out[64] = '\0';
 
 out:
-        kfree(desc);
-        crypto_free_shash(tfm);
-        return ret;
+	kfree(desc);
+	crypto_free_shash(tfm);
+	return ret;
+}
+
+/*
+ * verify_nodeid_integrity - compute NodeID twice and compare.
+ * Detects hardware instability on clinical and security surfaces.
+ */
+static int verify_nodeid_integrity(void)
+{
+	char verify_buf[NODEID_HEX_LEN];
+	int ret;
+
+	ret = compute_nodeid_into(verify_buf);
+	if (ret)
+		return ret;
+
+	if (memcmp(nodeid_hex, verify_buf, NODEID_HEX_LEN) != 0) {
+		pr_emerg("sorabbyngo: NodeID integrity FAILED — "
+			 "hardware identity inconsistent. Halting.\n");
+		return -EIO;
+	}
+	return 0;
 }
 
 static int nodeid_show(struct seq_file *m, void *v)
 {
-        seq_printf(m, "%s\n", nodeid_hex);
-        return 0;
+	if (!__ratelimit(&nodeid_rl)) {
+		pr_warn_ratelimited("sorabbyngo: NodeID read rate exceeded\n");
+		return -EBUSY;
+	}
+	seq_printf(m, "%s\n", nodeid_hex);
+	return 0;
 }
 
 static int nodeid_open(struct inode *inode, struct file *file)
 {
-        return single_open(file, nodeid_show, NULL);
+	return single_open(file, nodeid_show, NULL);
 }
 
 static const struct proc_ops nodeid_proc_ops = {
-        .proc_open    = nodeid_open,
-        .proc_read    = seq_read,
-        .proc_lseek   = seq_lseek,
-        .proc_release = single_release,
+	.proc_open    = nodeid_open,
+	.proc_read    = seq_read,
+	.proc_lseek   = seq_lseek,
+	.proc_release = single_release,
 };
 
 static int __init sorabbyngo_nodeid_init(void)
 {
-        int ret;
+	int ret;
 
-        ret = compute_nodeid();
-        if (ret) {
-                pr_err("sorabbyngo: failed to compute NodeID: %d\n", ret);
-                return ret;
-        }
+	ret = compute_nodeid_into(nodeid_hex);
+	if (ret) {
+		pr_err("sorabbyngo: failed to compute NodeID: %d\n", ret);
+		return ret;
+	}
 
-        sorabbyngo_proc_dir = proc_mkdir(SORABBYNGO_PROC_DIR, NULL);
-        if (!sorabbyngo_proc_dir)
-                return -ENOMEM;
+	/* Integrity check — compute twice, compare */
+	ret = verify_nodeid_integrity();
+	if (ret)
+		return ret;
 
-        if (!proc_create(SORABBYNGO_NODEID_FILE, 0444,
-                         sorabbyngo_proc_dir, &nodeid_proc_ops)) {
-                remove_proc_entry(SORABBYNGO_PROC_DIR, NULL);
-                return -ENOMEM;
-        }
+	sorabbyngo_proc_dir = proc_mkdir(SORABBYNGO_PROC_DIR, NULL);
+	if (!sorabbyngo_proc_dir)
+		return -ENOMEM;
 
-        pr_info("sorabbyngo: NodeID = %s\n", nodeid_hex);
-        return 0;
+	if (!proc_create(SORABBYNGO_NODEID_FILE, 0444,
+			 sorabbyngo_proc_dir, &nodeid_proc_ops)) {
+		remove_proc_entry(SORABBYNGO_PROC_DIR, NULL);
+		return -ENOMEM;
+	}
+
+	pr_info("sorabbyngo: NodeID = %s\n", nodeid_hex);
+	return 0;
 }
 
 static void __exit sorabbyngo_nodeid_exit(void)
 {
-        remove_proc_entry(SORABBYNGO_NODEID_FILE, sorabbyngo_proc_dir);
-        remove_proc_entry(SORABBYNGO_PROC_DIR, NULL);
-        pr_info("sorabbyngo: NodeID module unloaded\n");
+	remove_proc_entry(SORABBYNGO_NODEID_FILE, sorabbyngo_proc_dir);
+	remove_proc_entry(SORABBYNGO_PROC_DIR, NULL);
+	pr_info("sorabbyngo: NodeID module unloaded\n");
 }
 
 module_init(sorabbyngo_nodeid_init);
 module_exit(sorabbyngo_nodeid_exit);
-
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("SORABBYNGO Engineering");
 MODULE_DESCRIPTION("SORABBYNGO NodeID - Hardware-bound cryptographic identity");
