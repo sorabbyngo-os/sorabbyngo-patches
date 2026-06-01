@@ -1,11 +1,22 @@
 # SPDX-License-Identifier: GPL-2.0
 menu "Byngonet Network Identity"
+
 config BYNGONET_IDENTITY
-        tristate "Byngonet network identity layer"
-        select SORABBYNGO_NODEID
-        default m
-        help
-          Exposes Byngonet NodeID identity via /proc/byngonet_stats.
-          Netfilter hook will be re-enabled in v0.3 when stack is stable.
-          If unsure, say M.
+	tristate "Byngonet network identity layer v0.3"
+	depends on NETFILTER
+	depends on NETFILTER_XTABLES
+	select SORABBYNGO_NODEID
+	default m
+	help
+	  Sorabbyngo mesh network identity layer. Provides:
+	    - NodeID-verified peer allowlist via /proc/byngonet_peers
+	    - Netfilter hook on UDP port 7422 (AISP protocol)
+	    - Packet marking: verified peers tagged nfmark=0xBE00
+	    - Statistics at /proc/byngonet_stats
+
+	  Uses sorabbyngo_get_nodeid() accessor (read-only after init).
+	  MODULE_SOFTDEP enforces load order after sorabbyngo_nodeid.
+
+	  If unsure, say M.
+
 endmenu

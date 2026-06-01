@@ -1,0 +1,118 @@
+From: SORABBYNGO Engineering <kernel@sorabbyngo.com>
+Subject: [PATCH 0014] kconfig: add eBPF hardening, LSM, and audit Kconfig options
+
+Adds CONFIG_SORABBYNGO_BPF_HARDENING, CONFIG_SECURITY_SORABBYNGO,
+CONFIG_SORABBYNGO_AUDIT_CHAIN, and CONFIG_SORABBYNGO_WATCHDOG_BPF
+to security/Kconfig.sorabbyngo and updates sorabbyngo.config.
+
+Also updates LSM stack order in CONFIG_LSM to include sorabbyngo
+and corrects byngonet Kconfig help text (hook is now active in v0.3).
+---
+ security/Kconfig.sorabbyngo |  65 +++++++++++++++++
+ sorabbyngo.config           |  22 +++++-
+ drivers/sorabbyngo/byngonet/Kconfig | 4 +-
+ 3 files changed, 88 insertions(+), 3 deletions(-)
+
+diff --git a/security/Kconfig.sorabbyngo b/security/Kconfig.sorabbyngo
+new file mode 100644
+--- /dev/null
++++ b/security/Kconfig.sorabbyngo
+@@ -0,0 +1,65 @@
++# SPDX-License-Identifier: GPL-2.0
++# Sorabbyngo security subsystem options
++
++config SORABBYNGO_BPF_HARDENING
++	bool "Sorabbyngo eBPF hardening"
++	depends on BPF_SYSCALL
++	default y
++	help
++	  Restricts BPF program loading to CAP_BPF + CAP_SYS_ADMIN,
++	  forces JIT constant blinding (harden=2), lowers verifier
++	  complexity limit to 256K instructions, and audits all BPF
++	  loads to the Sorabbyngo audit chain.
++
++	  Cyberwall's XDP programs still work — they run as root with
++	  CAP_BPF. All other processes cannot load BPF programs.
++
++	  If unsure, say Y.
++
++config SECURITY_SORABBYNGO
++	bool "Sorabbyngo Linux Security Module"
++	depends on SECURITY
++	depends on SORABBYNGO_NODEID
++	default y
++	help
++	  Stacked LSM enforcing:
++	    - NodeID-based process identity labels
++	    - File integrity for /opt/sorabbyngo/ binaries (IMA)
++	    - Byngonet socket restriction (port 7422)
++	    - CML enforcement for outbound AI API calls
++	    - Full audit trail to SHA-256 chain
++
++	  Add "sorabbyngo" to CONFIG_LSM to activate.
++	  Recommended LSM stack: sorabbyngo,selinux,bpf
++
++	  If unsure, say Y.
++
++config SORABBYNGO_AUDIT_CHAIN
++	bool "Sorabbyngo SHA-256 kernel audit chain"
++	depends on CRYPTO_SHA256
++	depends on SORABBYNGO_NODEID
++	default y
++	help
++	  Append-only SHA-256 chained audit log for kernel security
++	  events. Every LSM denial, BPF load, module load, pledge call,
++	  and privilege escalation is recorded.
++
++	  Chain root hash exposed at /proc/sorabbyngo/audit_root.
++	  Kenya DPA 2019 s.41 compliance for health data systems.
++
++	  If unsure, say Y.
++
++config SORABBYNGO_WATCHDOG_BPF
++	bool "Sorabbyngo os-watchdog eBPF probes"
++	depends on BPF_SYSCALL
++	depends on SORABBYNGO_BPF_HARDENING
++	depends on SORABBYNGO_AUDIT_CHAIN
++	default y
++	help
++	  Kernel-side eBPF program skeleton for the os-watchdog daemon.
++	  Monitors syscalls (pledge compliance), exec, network connects,
++	  and module loads via tracepoints.
++
++	  Events delivered to userspace via BPF ring buffer at
++	  /sys/fs/bpf/sorabbyngo/watchdog_events.
++
++	  Requires os-watchdog daemon from sorabbyngo-os/os-watchdog.
++
++	  If unsure, say Y.
+
+diff --git a/sorabbyngo.config b/sorabbyngo.config
+--- a/sorabbyngo.config
++++ b/sorabbyngo.config
+@@ sorabbyngo.config additions @@
++# ── eBPF hardening ────────────────────────────────────────────────────
++CONFIG_SORABBYNGO_BPF_HARDENING=y
++CONFIG_BPF_JIT_ALWAYS_ON=y
++CONFIG_BPF_JIT_DEFAULT_ON=y
++CONFIG_BPF_UNPRIV_DEFAULT_OFF=y
++CONFIG_BPF_JIT_HARDEN=2
++
++# ── Sorabbyngo LSM ────────────────────────────────────────────────────
++CONFIG_SECURITY_SORABBYNGO=y
++CONFIG_LSM="sorabbyngo,selinux,bpf"
++CONFIG_SECURITY_SELINUX=y
++CONFIG_SECURITY_SELINUX_BOOTPARAM=y
++CONFIG_IMA=y
++CONFIG_IMA_MEASURE_PCR_IDX=10
++CONFIG_IMA_APPRAISE=y
++CONFIG_IMA_APPRAISE_BOOTPARAM=y
++
++# ── Audit chain ───────────────────────────────────────────────────────
++CONFIG_SORABBYNGO_AUDIT_CHAIN=y
++CONFIG_AUDIT=y
++CONFIG_AUDITSYSCALL=y
++CONFIG_CRYPTO_SHA256=y
++
++# ── Watchdog eBPF ─────────────────────────────────────────────────────
++CONFIG_SORABBYNGO_WATCHDOG_BPF=y
