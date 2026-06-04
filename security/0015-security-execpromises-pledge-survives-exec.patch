@@ -1,0 +1,273 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sorabbyngo OS <security@sorabbyngo-os>
+Date: Mon, 02 Jun 2026 00:00:00 +0300
+Subject: [PATCH 0015] security: execpromises — pledge constraints survive exec()
+
+Inspired by OpenBSD kern_pledge.c sys_pledge() / execpromises machinery
+(kern_pledge.c v1.390+, lines 449-510).
+
+Problem: The Sorabbyngo pledge layer (patch 0002) drops all pledge
+restrictions when a process calls execve(). This is a hard security gap
+for the CML (Cognitive Mediation Layer) — AI agent subprocesses spawned
+via exec() start with a clean, unrestricted slate, bypassing the
+PLEDGE_CML_API enforcement in patch 0012.
+
+Solution: Add a ps_execpledge bitmask to task_struct that carries forward
+into the new image on execve(). The new image's pledge is initialised to
+ps_execpledge, not to PLEDGE_ALL. Reductions are one-way (only tighter
+constraints permitted), mirroring OpenBSD's EPERM-on-expansion semantics.
+
+This directly secures the CML subprocess chain:
+  byngox agent → exec(child) → child inherits restricted pledge
+  → PLEDGE_CML_API enforced from first instruction of child
+
+Key design decisions vs OpenBSD:
+  - ps_execpledge stored in task->sorabbyngo_pledge_exec (u64)
+    alongside existing task->sorabbyngo_pledge (patch 0002)
+  - PS_EXECPLEDGE flag tracked in task->sorabbyngo_pledge_flags
+  - exec boundary hook inserted in security_bprm_committed_creds()
+    (Sorabbyngo LSM hook, patch 0012) rather than a custom execve wrapper
+  - NodeID of executing process recorded in execpledge audit entry
+    for Kenya DPA 2019 forensic trace (patch 0013)
+
+Signed-off-by: Sorabbyngo OS <security@sorabbyngo-os>
+---
+ include/linux/sorabbyngo_pledge.h              |  18 +++
+ security/sorabbyngo/pledge.c                   | 102 ++++++++++++++++-
+ security/sorabbyngo/lsm.c                      |  28 +++++
+ 3 files changed, 148 insertions(+), 0 deletions(-)
+
+diff --git a/include/linux/sorabbyngo_pledge.h b/include/linux/sorabbyngo_pledge.h
+index XXXXXXX..XXXXXXX 100644
+--- a/include/linux/sorabbyngo_pledge.h
++++ b/include/linux/sorabbyngo_pledge.h
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+ /*
+  * Sorabbyngo pledge/unveil syscall restriction layer.
++ * Patch 0015: execpromises — pledge survives exec().
+  * Inspired by OpenBSD kern_pledge.c.
+  */
+ #ifndef _LINUX_SORABBYNGO_PLEDGE_H
+@@ -20,6 +21,14 @@
+ #define SPLEDGE_FLAG_ACTIVE     BIT(0)
+ #define SPLEDGE_FLAG_ERROR_MODE BIT(1)
+ #define SPLEDGE_FLAG_EXECPLEDGE BIT(2)  /* ps_execpledge is set */
++
++/*
++ * PLEDGE_INHERIT_NONE: sentinel meaning "exec child gets no pledge
++ * inheritance" — used when execpromises was never set.  Distinct from
++ * zero (which would mean "all bits cleared = maximally restricted").
++ */
++#define SPLEDGE_INHERIT_NONE    (~0ULL)
++
++/* Accessor: true if execpledge is armed for this task */
++#define task_has_execpledge(t) \
++	((t)->sorabbyngo_pledge_flags & SPLEDGE_FLAG_EXECPLEDGE)
+
+ /* Pledge bitmask definitions (must match patch 0002) */
+ #define PLEDGE_STDIO        BIT_ULL(0)
+@@ -40,6 +49,15 @@ struct sorabbyngo_pledge_state {
+ 	u64     promises;           /* current active pledge bitmask    */
+ 	u64     execpromises;       /* pledge to impose after next exec  */
+ 	u32     flags;              /* SPLEDGE_FLAG_* above              */
++	/*
++	 * Snapshot of the NodeID that set execpromises — recorded here so
++	 * the audit chain (patch 0013) can attribute exec-boundary pledge
++	 * events to the correct entity even after the parent has exited.
++	 */
++	u8      execpromise_nodeid[NODEID_HEX_LEN];
+ };
+
+ /* Public API */
+ int  sorabbyngo_pledge_set(struct task_struct *task, u64 promises,
+ 			    u64 execpromises);
++int  sorabbyngo_pledge_apply_exec(struct task_struct *task);
++bool sorabbyngo_pledge_exec_reduces(struct task_struct *task,
++				     u64 new_execpromises);
+
+ #endif /* _LINUX_SORABBYNGO_PLEDGE_H */
+
+diff --git a/security/sorabbyngo/pledge.c b/security/sorabbyngo/pledge.c
+index XXXXXXX..XXXXXXX 100644
+--- a/security/sorabbyngo/pledge.c
++++ b/security/sorabbyngo/pledge.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+  * Sorabbyngo pledge layer — syscall restriction.
++ * Patch 0015: execpromises support.
+  *
+  * Inspired by OpenBSD kern_pledge.c (Theo de Raadt et al.)
+  * OpenBSD reference: sys/kern/kern_pledge.c,v 1.390
+@@ -8,6 +9,7 @@
+ #include <linux/sched.h>
+ #include <linux/slab.h>
+ #include <linux/sorabbyngo_pledge.h>
++#include <linux/sorabbyngo_nodeid.h>   /* nodeid_get_hex() */
++#include <linux/sorabbyngo_audit.h>    /* sorabbyngo_audit_emit() */
+
+ /*
+  * sorabbyngo_pledge_set - called from the pledge(2)-equivalent syscall.
+@@ -63,6 +65,106 @@ int sorabbyngo_pledge_set(struct task_struct *task,
+ 	return 0;
+ }
+
++/*
++ * sorabbyngo_pledge_apply_exec - apply execpromises at the exec boundary.
++ *
++ * Called from sorabbyngo_lsm_bprm_committed_creds() (see lsm.c) after
++ * the new image is loaded but before it starts executing.  Mirrors the
++ * OpenBSD pattern in kern_exec.c where ps_execpledge is transferred to
++ * ps_pledge on exec.
++ *
++ * Logic (faithful to OpenBSD semantics):
++ *   1. If SPLEDGE_FLAG_EXECPLEDGE is not set: inherit nothing — the
++ *      exec child runs without any pledge restriction.  This preserves
++ *      backwards compatibility for processes that never called pledge().
++ *
++ *   2. If SPLEDGE_FLAG_EXECPLEDGE is set: the new image's active pledge
++ *      is set to execpromises.  The execpromises slot is then cleared
++ *      (one-shot: the grandchild exec gets nothing unless it calls
++ *      pledge() again with execpromises).
++ *
++ *   3. The PS_EXECPLEDGE flag is cleared in the new image; PS_PLEDGE is
++ *      set to reflect that the new image is now under pledge.
++ *
++ * Returns 0 on success, -EPERM if the transition would expand privileges
++ * (shouldn't happen here but guards against race with fork).
++ */
++int sorabbyngo_pledge_apply_exec(struct task_struct *task)
++{
++	struct sorabbyngo_pledge_state *st;
++	u64 new_promises;
++	char nodeid_hex[NODEID_HEX_LEN + 1] = "<unknown>";
++
++	if (!task)
++		return 0;
++
++	st = task->sorabbyngo_pledge;
++	if (!st)
++		return 0;
++
++	/* Case 1: no execpromises armed — nothing to do */
++	if (!(st->flags & SPLEDGE_FLAG_EXECPLEDGE))
++		return 0;
++
++	/* execpromises == SPLEDGE_INHERIT_NONE means "wipe pledge on exec" */
++	if (st->execpromises == SPLEDGE_INHERIT_NONE) {
++		st->promises = 0;
++		st->flags &= ~(SPLEDGE_FLAG_ACTIVE | SPLEDGE_FLAG_EXECPLEDGE);
++		return 0;
++	}
++
++	new_promises = st->execpromises;
++
++	/*
++	 * Safety check: execpromises must be a subset of current promises.
++	 * OpenBSD enforces this at pledge()-call time (EPERM on expansion).
++	 * We re-check here to close any fork/exec race window.
++	 */
++	if (st->flags & SPLEDGE_FLAG_ACTIVE) {
++		if ((new_promises | st->promises) != st->promises) {
++			pr_warn_ratelimited(
++			    "sorabbyngo: execpromises expansion attempt "
++			    "blocked for pid %d (nodeid: %s)\n",
++			    task->pid, nodeid_hex);
++			return -EPERM;
++		}
++	}
++
++	/* Snapshot NodeID for audit before we overwrite state */
++	nodeid_get_hex(nodeid_hex, sizeof(nodeid_hex));
++	memcpy(st->execpromise_nodeid, nodeid_hex, NODEID_HEX_LEN);
++
++	/* Apply: new image runs under execpromises */
++	st->promises = new_promises;
++	st->flags |= SPLEDGE_FLAG_ACTIVE;
++	st->flags &= ~SPLEDGE_FLAG_EXECPLEDGE;
++	/* execpromises is one-shot — grandchild exec inherits nothing */
++	st->execpromises = SPLEDGE_INHERIT_NONE;
++
++	/* Emit audit event for Kenya DPA 2019 traceability (patch 0013) */
++	sorabbyngo_audit_emit(SORABBYNGO_AUDIT_EXECPLEDGE,
++			      "pid=%d nodeid=%s new_pledge=0x%016llx",
++			      task->pid, nodeid_hex, new_promises);
++
++	return 0;
++}
++
++/*
++ * sorabbyngo_pledge_exec_reduces - validate that new execpromises are <=
++ * current active promises.  Called from the pledge syscall handler.
++ * Mirrors OpenBSD: "Only permit reductions" (kern_pledge.c:490).
++ */
++bool sorabbyngo_pledge_exec_reduces(struct task_struct *task,
++				     u64 new_execpromises)
++{
++	struct sorabbyngo_pledge_state *st = task->sorabbyngo_pledge;
++
++	if (!st || !(st->flags & SPLEDGE_FLAG_ACTIVE))
++		return true;  /* not yet pledged — any value OK */
++
++	/* new_execpromises must be a strict subset of current promises */
++	return (new_execpromises | st->promises) == st->promises;
++}
++
+ EXPORT_SYMBOL_GPL(sorabbyngo_pledge_set);
++EXPORT_SYMBOL_GPL(sorabbyngo_pledge_apply_exec);
++EXPORT_SYMBOL_GPL(sorabbyngo_pledge_exec_reduces);
+
+diff --git a/security/sorabbyngo/lsm.c b/security/sorabbyngo/lsm.c
+index XXXXXXX..XXXXXXX 100644
+--- a/security/sorabbyngo/lsm.c
++++ b/security/sorabbyngo/lsm.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+  * Sorabbyngo LSM — NodeID process labels, IMA integration, CML enforcement.
++ * Patch 0015: hook execpromises application at bprm_committed_creds.
+  */
+ #include <linux/lsm_hooks.h>
+ #include <linux/sorabbyngo_pledge.h>
+@@ -42,6 +43,33 @@ static int sorabbyngo_lsm_bprm_check_security(struct linux_binprm *bprm)
+ 	return 0;
+ }
+
++/*
++ * sorabbyngo_lsm_bprm_committed_creds - exec boundary pledge transfer.
++ *
++ * This is the correct hook point: credentials are already committed to
++ * the new image, but the process has not yet started executing userspace
++ * code.  We apply execpromises here so the new image is under the correct
++ * pledge from its very first syscall.
++ *
++ * OpenBSD equivalent: the pledge transfer in kern/kern_exec.c after
++ * execve() succeeds and before returning to userspace.
++ */
++static void sorabbyngo_lsm_bprm_committed_creds(struct linux_binprm *bprm)
++{
++	struct task_struct *task = current;
++	int ret;
++
++	ret = sorabbyngo_pledge_apply_exec(task);
++	if (ret == -EPERM) {
++		/*
++		 * Expansion attempt at exec boundary — this is a kernel bug
++		 * (should have been caught at pledge() call time).  Kill the
++		 * process rather than let it run with wrong privileges.
++		 */
++		pr_err("sorabbyngo: execpromises expansion at exec boundary "
++		       "for pid %d — sending SIGKILL\n", task->pid);
++		force_sig(SIGKILL);
++	}
++}
++
+ static struct security_hook_list sorabbyngo_hooks[] __lsm_ro_after_init = {
+ 	LSM_HOOK_INIT(bprm_check_security, sorabbyngo_lsm_bprm_check_security),
++	LSM_HOOK_INIT(bprm_committed_creds, sorabbyngo_lsm_bprm_committed_creds),
+ 	/* ... existing hooks ... */
+ };
+-- 
+Sorabbyngo OS — OpenBSD-inspired security hardening
+Reference: OpenBSD sys/kern/kern_pledge.c,v 1.390 (execpromises machinery)
