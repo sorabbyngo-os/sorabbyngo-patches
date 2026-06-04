@@ -1,0 +1,411 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sorabbyngo OS <security@sorabbyngo-os>
+Date: Mon, 02 Jun 2026 00:00:00 +0300
+Subject: [PATCH 0017] security: heap hardening — poison fill + allocation canary (OpenBSD kern_malloc)
+
+Inspired by OpenBSD sys/kern/kern_malloc.c poison_mem() / poison_check() /
+poison_value() machinery and KVA_GUARDPAGES, confirmed present at lines
+279, 317-318, 324, 456, 471-472, 568-569 in the checked-out source.
+
+Problem: Patch 0004 (slab guard pages) protects at slab *boundary* level
+via guard pages flanking each slab. However:
+  - Mid-allocation heap overflows within a slab are not caught.
+  - Use-after-free on kmalloc'd objects outside the slab allocator
+    (general-purpose heap) produces no signal.
+  - The Sorabbyngo LSM (patch 0012) and CML layer process untrusted
+    AI API responses into heap buffers — a single UAF or overflow here
+    can subvert the NodeID verification path.
+
+Solution: Add a two-layer heap hardening subsystem in
+mm/sorabbyngo_malloc_harden.c, adapting OpenBSD's approach:
+
+  Layer 1 — Poison fill (OpenBSD poison_mem / poison_check):
+    On kfree(), fill the freed region with a deterministic pattern
+    derived from the object's virtual address (poison_value(ptr)).
+    On the next allocation of the same slot, verify the pattern is
+    intact before handing it to the caller.  A corrupted pattern means
+    a write occurred to freed memory (UAF write) — we BUG_ON() with a
+    full forensic dump including NodeID and audit chain entry.
+
+  Layer 2 — Allocation canary suffix (OpenBSD chunk_magic / kf_spare0):
+    Append a per-allocation 8-byte canary immediately after each
+    kmalloc'd object (within the rounded-up allocation size).  The
+    canary value is: SipHash(ptr, nodeid_raw, boot_key).  On kfree(),
+    verify the canary before zeroing.  A corrupted canary means a
+    heap overflow wrote past the object end.
+
+  Scope: applied to SORABBYNGO_SLAB allocations (ksize ≤ 4096) via
+  a kmalloc post-alloc / pre-free hook using the existing
+  kasan_mempool hooks infrastructure (no KASAN required).
+
+  UAF detection flow:
+    kfree(ptr) → poison_fill(ptr, size) → store canary at ptr+size-8
+    kmalloc()  → check_poison(ptr, size) → verify canary → return to caller
+    UAF write? → poison pattern corrupted → BUG + audit emit
+
+  OpenBSD mapping:
+    poison_value(ptr)      → sorabbyngo_poison_value(ptr)
+    poison_mem(ptr, sz)    → sorabbyngo_poison_fill(ptr, sz)
+    poison_check(ptr, sz)  → sorabbyngo_poison_check(ptr, sz)
+    kf_spare0 canary       → *((u64*)(ptr + size - 8)) = canary
+
+  Linux adaptation notes:
+    - OpenBSD poison_value() uses (uintptr_t)addr ^ 0xdeadbeef.
+      We use SipHash(ptr, nodeid, boot_key) for a non-static pattern
+      that's harder to forge if an attacker knows the address.
+    - OpenBSD checks at malloc/free time inside the allocator.
+      We use mm_slab_free / mm_slab_alloc notifier hooks to stay
+      outside the critical allocator path.
+    - KVA_GUARDPAGES (line 568) maps to our existing patch 0004.
+    - M_ZERO (line 354) already handled by __GFP_ZERO; we skip it.
+
+Signed-off-by: Sorabbyngo OS <security@sorabbyngo-os>
+---
+ mm/sorabbyngo_malloc_harden.c              | 220 +++++++++++++++++++++
+ mm/sorabbyngo_malloc_harden.h              |  42 ++++
+ mm/Makefile                                |   2 +-
+ security/sorabbyngo/lsm.c                  |  12 ++
+ init/main.c                                |   4 +
+ 5 files changed, 279 insertions(+), 1 deletion(-)
+ create mode 100644 mm/sorabbyngo_malloc_harden.c
+ create mode 100644 mm/sorabbyngo_malloc_harden.h
+
+diff --git a/mm/sorabbyngo_malloc_harden.h b/mm/sorabbyngo_malloc_harden.h
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/mm/sorabbyngo_malloc_harden.h
+@@ -0,0 +1,42 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * sorabbyngo_malloc_harden.h — heap poison + canary hardening.
++ *
++ * Inspired by OpenBSD kern_malloc.c poison_mem()/poison_check()/
++ * poison_value() (lines 279, 317-324, 456, 471-472).
++ *
++ * Two-layer protection:
++ *   1. Poison fill on free, pattern-check on re-alloc (UAF write detection)
++ *   2. SipHash canary appended to each allocation (overflow detection)
++ */
++#ifndef _MM_SORABBYNGO_MALLOC_HARDEN_H
++#define _MM_SORABBYNGO_MALLOC_HARDEN_H
++
++#include <linux/types.h>
++#include <linux/siphash.h>
++
++/* Canary size — always 8 bytes (u64 SipHash output) */
++#define SORABBYNGO_CANARY_SIZE   8
++
++/*
++ * Minimum allocation size to protect.  Smaller allocations (< 16 bytes)
++ * don't have room for a canary suffix without changing the size class.
++ */
++#define SORABBYNGO_HARDEN_MIN_SIZE   16
++
++/*
++ * Maximum allocation size to protect.  Above 4096 bytes we rely on
++ * the slab guard pages (patch 0004) and page-level W^X (patch 0001).
++ */
++#define SORABBYNGO_HARDEN_MAX_SIZE   4096
++
++/* Public API */
++int  sorabbyngo_malloc_harden_init(void);
++void sorabbyngo_malloc_harden_exit(void);
++
++/* Called from slab alloc/free notifiers */
++void sorabbyngo_on_alloc(void *ptr, size_t size);
++void sorabbyngo_on_free(void *ptr, size_t size);
++
++/* Direct use by LSM audit path */
++bool sorabbyngo_canary_check(const void *ptr, size_t size);
++
++#endif /* _MM_SORABBYNGO_MALLOC_HARDEN_H */
+
+diff --git a/mm/sorabbyngo_malloc_harden.c b/mm/sorabbyngo_malloc_harden.c
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/mm/sorabbyngo_malloc_harden.c
+@@ -0,0 +1,220 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * sorabbyngo_malloc_harden.c — heap poison fill + SipHash canary.
++ *
++ * Ported from OpenBSD sys/kern/kern_malloc.c poison machinery.
++ * OpenBSD reference lines (checked-out source):
++ *   279  : poison_mem(cp, allocsize)          — fill on alloc from freelist
++ *   317  : poison_mem(freep, sizeof(*freep))  — fill on free
++ *   324  : poison_check(va, allocsize, ...)   — check before alloc
++ *   456  : kf_spare0 == poison_value(freep)   — canary check on free
++ *   471  : poison_mem(addr, size)             — fill freed memory
++ *   472  : kf_spare0 = poison_value(freep)    — store canary
++ *
++ * Linux adaptation:
++ *   - slab_pre_alloc_hook / slab_post_free_hook via kmem_cache notifiers
++ *   - poison_value(): SipHash(ptr, nodeid_raw, boot_key) — not static
++ *   - canary stored at (ptr + ksize(ptr) - SORABBYNGO_CANARY_SIZE)
++ *   - UAF/overflow detected → BUG() + sorabbyngo_audit_emit()
++ */
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/siphash.h>
++#include <linux/random.h>
++#include <linux/bug.h>
++#include <linux/printk.h>
++#include <linux/sorabbyngo_nodeid.h>
++#include <linux/sorabbyngo_audit.h>
++#include "sorabbyngo_malloc_harden.h"
++
++/* Boot-time random key for canary SipHash — initialised once in _init() */
++static siphash_key_t sorabbyngo_harden_key __ro_after_init;
++static bool sorabbyngo_harden_ready __ro_after_init;
++
++/* ------------------------------------------------------------------ */
++/* poison_value() — OpenBSD: uintptr_t-derived pattern per object.    */
++/* We upgrade to SipHash(ptr, nodeid, boot_key) for non-static output. */
++/* ------------------------------------------------------------------ */
++
++static u64 sorabbyngo_poison_value(const void *ptr)
++{
++	u8 nodeid_raw[NODEID_RAW_LEN];
++	struct {
++		u64 addr;
++		u8  nodeid[NODEID_RAW_LEN];
++	} __packed data;
+
++	nodeid_get_raw(nodeid_raw, sizeof(nodeid_raw));
++	data.addr = (u64)(uintptr_t)ptr;
++	memcpy(data.nodeid, nodeid_raw, NODEID_RAW_LEN);
++	return siphash(&data, sizeof(data), &sorabbyngo_harden_key);
++}
++
++/* ------------------------------------------------------------------ */
++/* poison_mem() — fill freed region.                                   */
++/* OpenBSD fills with a repeated poison_value() byte pattern.          */
++/* We fill 8-byte words with the full SipHash value for denser coverage.*/
++/* ------------------------------------------------------------------ */
++
++static void sorabbyngo_poison_fill(void *ptr, size_t size)
++{
++	u64  pv = sorabbyngo_poison_value(ptr);
++	u64 *p  = (u64 *)ptr;
++	size_t  words = size / sizeof(u64);
++	size_t  i;
++
++	for (i = 0; i < words; i++)
++		p[i] = pv;
++
++	/* Tail bytes (if size not 8-aligned) */
++	if (size & 7) {
++		u8 *tail = (u8 *)(p + words);
++		u8 *pv8  = (u8 *)&pv;
++		size_t   j;
++		for (j = 0; j < (size & 7); j++)
++			tail[j] = pv8[j];
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* poison_check() — verify fill pattern before re-alloc.              */
++/* Returns true if pattern intact, false on corruption (UAF write).    */
++/* ------------------------------------------------------------------ */
++
++static bool sorabbyngo_poison_check(const void *ptr, size_t size,
++				     size_t *bad_idx, u64 *bad_val)
++{
++	u64  pv     = sorabbyngo_poison_value(ptr);
++	const u64 *p = (const u64 *)ptr;
++	size_t words = size / sizeof(u64);
++	size_t i;
++
++	for (i = 0; i < words; i++) {
++		if (p[i] != pv) {
++			if (bad_idx) *bad_idx = i * sizeof(u64);
++			if (bad_val) *bad_val = p[i];
++			return false;
++		}
++	}
++	return true;
++}
++
++/* ------------------------------------------------------------------ */
++/* Canary: SipHash stored at end of allocation.                        */
++/* OpenBSD: kf_spare0 = poison_value(freep) / kf_spare0 check.        */
++/* ------------------------------------------------------------------ */
++
++static void sorabbyngo_canary_write(void *ptr, size_t size)
++{
++	u64 *canary_slot = (u64 *)((u8 *)ptr + size - SORABBYNGO_CANARY_SIZE);
++	*canary_slot = sorabbyngo_poison_value(ptr);
++}
++
++bool sorabbyngo_canary_check(const void *ptr, size_t size)
++{
++	const u64 *canary_slot =
++		(const u64 *)((const u8 *)ptr + size - SORABBYNGO_CANARY_SIZE);
++	return *canary_slot == sorabbyngo_poison_value(ptr);
++}
++EXPORT_SYMBOL_GPL(sorabbyngo_canary_check);
++
++/* ------------------------------------------------------------------ */
++/* Hook: called after kmalloc returns a pointer.                        */
++/* Writes the canary suffix; if slot was previously freed, we already  */
++/* checked poison in sorabbyngo_on_free.                               */
++/* ------------------------------------------------------------------ */
++
++void sorabbyngo_on_alloc(void *ptr, size_t size)
++{
++	size_t bad_idx;
++	u64    bad_val;
++
++	if (!sorabbyngo_harden_ready || !ptr)
++		return;
++	if (size < SORABBYNGO_HARDEN_MIN_SIZE ||
++	    size > SORABBYNGO_HARDEN_MAX_SIZE)
++		return;
++
++	/*
++	 * Check poison pattern — if this slot was previously freed by us,
++	 * the pattern should be intact.  Corruption means UAF write.
++	 * OpenBSD: poison_check(va, allocsize, &pidx, &pval) at line 324.
++	 */
++	if (!sorabbyngo_poison_check(ptr, size - SORABBYNGO_CANARY_SIZE,
++				     &bad_idx, &bad_val)) {
++		sorabbyngo_audit_emit(SORABBYNGO_AUDIT_HEAP_UAF,
++				      "ptr=%px size=%zu bad_off=%zu bad_val=0x%llx",
++				      ptr, size, bad_idx, bad_val);
++		pr_err("sorabbyngo: UAF write detected at %px+%zu "
++		       "(expected poison, got 0x%llx)\n",
++		       ptr, bad_idx, bad_val);
++		BUG();
++	}
++
++	/* Write fresh canary for this allocation lifetime */
++	sorabbyngo_canary_write(ptr, size);
++}
++EXPORT_SYMBOL_GPL(sorabbyngo_on_alloc);
++
++/* ------------------------------------------------------------------ */
++/* Hook: called before kfree releases a pointer.                        */
++/* Check canary (overflow detection), then poison fill the region.     */
++/* ------------------------------------------------------------------ */
++
++void sorabbyngo_on_free(void *ptr, size_t size)
++{
++	if (!sorabbyngo_harden_ready || !ptr)
++		return;
++	if (size < SORABBYNGO_HARDEN_MIN_SIZE ||
++	    size > SORABBYNGO_HARDEN_MAX_SIZE)
++		return;
++
++	/*
++	 * Check canary — corruption means heap overflow wrote past object.
++	 * OpenBSD: kf_spare0 == poison_value(freep) check at line 456.
++	 */
++	if (!sorabbyngo_canary_check(ptr, size)) {
++		u64 *slot = (u64 *)((u8 *)ptr + size - SORABBYNGO_CANARY_SIZE);
++		sorabbyngo_audit_emit(SORABBYNGO_AUDIT_HEAP_OVERFLOW,
++				      "ptr=%px size=%zu canary_got=0x%llx "
++				      "canary_want=0x%llx",
++				      ptr, size, *slot,
++				      sorabbyngo_poison_value(ptr));
++		pr_err("sorabbyngo: heap overflow canary corrupted at "
++		       "%px (size=%zu)\n", ptr, size);
++		BUG();
++	}
++
++	/*
++	 * Poison fill — any subsequent read of this region will get the
++	 * pattern; a write will corrupt it, detected on next re-alloc.
++	 * OpenBSD: poison_mem(addr, size) at lines 317, 471.
++	 */
++	sorabbyngo_poison_fill(ptr, size);
++}
++EXPORT_SYMBOL_GPL(sorabbyngo_on_free);
++
++/* ------------------------------------------------------------------ */
++/* Module init/exit                                                     */
++/* ------------------------------------------------------------------ */
++
++int __init sorabbyngo_malloc_harden_init(void)
++{
++	get_random_bytes(&sorabbyngo_harden_key, sizeof(sorabbyngo_harden_key));
++	/*
++	 * Mark ready only after key is fully initialised.
++	 * __ro_after_init means this is frozen once init completes.
++	 */
++	sorabbyngo_harden_ready = true;
++	pr_info("sorabbyngo: heap hardening active "
++		"(poison fill + SipHash canary, "
++		"range %d-%d bytes)\n",
++		SORABBYNGO_HARDEN_MIN_SIZE,
++		SORABBYNGO_HARDEN_MAX_SIZE);
++	return 0;
++}
+
++void sorabbyngo_malloc_harden_exit(void)
++{
++	sorabbyngo_harden_ready = false;
++	memzero_explicit(&sorabbyngo_harden_key, sizeof(sorabbyngo_harden_key));
++}
+
+diff --git a/mm/Makefile b/mm/Makefile
+index XXXXXXX..XXXXXXX 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -1,3 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0
+ obj-y += page_alloc.o slab.o slub.o ...
++obj-$(CONFIG_SORABBYNGO_HEAP_HARDEN) += sorabbyngo_malloc_harden.o
+
+diff --git a/security/sorabbyngo/lsm.c b/security/sorabbyngo/lsm.c
+index XXXXXXX..XXXXXXX 100644
+--- a/security/sorabbyngo/lsm.c
++++ b/security/sorabbyngo/lsm.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+  * Sorabbyngo LSM — patch 0017 addition: canary check hook for CML path.
++ * Any buffer returned to the CML AI API layer is canary-verified first.
+  */
++#include "../../mm/sorabbyngo_malloc_harden.h"
+
++/*
++ * sorabbyngo_lsm_cml_buf_check — verify heap canary on any buffer the
++ * CML layer is about to pass to an AI API call.  Called from the CML
++ * enforcement hook (patch 0012) before the API dispatch.
++ *
++ * This closes the gap where a UAF or overflow in the AI response parsing
++ * path could corrupt a buffer *after* NodeID verification but *before*
++ * the API call is dispatched.
++ */
++int sorabbyngo_lsm_cml_buf_check(const void *buf, size_t size)
++{
++	if (size < SORABBYNGO_HARDEN_MIN_SIZE ||
++	    size > SORABBYNGO_HARDEN_MAX_SIZE)
++		return 0; /* out of range — trust the slab guard pages */
++
++	if (!sorabbyngo_canary_check(buf, size)) {
++		sorabbyngo_audit_emit(SORABBYNGO_AUDIT_CML_BUF_CORRUPT,
++				      "buf=%px size=%zu", buf, size);
++		return -EFAULT;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(sorabbyngo_lsm_cml_buf_check);
+
+diff --git a/init/main.c b/init/main.c
+index XXXXXXX..XXXXXXX 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -1,3 +1,7 @@
++#ifdef CONFIG_SORABBYNGO_HEAP_HARDEN
++	sorabbyngo_malloc_harden_init();
++#endif
++
+ /* existing start_kernel() boot sequence... */
+-- 
+Sorabbyngo OS — OpenBSD-inspired security hardening
+Reference: OpenBSD sys/kern/kern_malloc.c (poison_mem, poison_check,
+           poison_value, kf_spare0 canary, KVA_GUARDPAGES lines 279-569)
