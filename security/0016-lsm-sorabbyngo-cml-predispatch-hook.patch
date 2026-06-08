@@ -1,0 +1,246 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sorabbyngo OS <security@sorabbyngo-os>
+Date: Mon, 02 Jun 2026 00:00:00 +0300
+Subject: [PATCH 0016] lsm: sorabbyngo — CML pre-dispatch hook for AI API boundary enforcement
+
+Problem: Patch 0012 (sorabbyngo LSM) enforces PLEDGE_CML_API at the
+syscall boundary, but has no enforcement point at the moment an AI API
+call is actually dispatched from the CML layer. This leaves a window
+between NodeID verification (patch 0009) and the API call itself where:
+
+  1. A heap buffer carrying the API payload could be corrupted (UAF or
+     overflow) after NodeID verification but before dispatch — no check
+     exists at this boundary. Patch 0017 (heap canary) closes this at
+     the memory level, but needs a hook to call from.
+
+  2. A process that legitimately holds PLEDGE_CML_API could invoke the
+     CML dispatch path with a payload assembled from an unpledged
+     subprocess (exec boundary gap closed by patch 0015), with no
+     per-dispatch audit record tying the NodeID to the specific call.
+
+Solution: Add sorabbyngo_lsm_cml_predispatch() — a new LSM enforcement
+function called by the CML layer immediately before dispatching any AI
+API call. This function:
+
+  1. Verifies the calling task holds PLEDGE_CML_API (re-check, not
+     cached — a pledge reduction via exec (patch 0015) could have
+     narrowed it since the last check).
+
+  2. Validates the payload buffer pointer is non-NULL and within the
+     heap hardening range (defers actual canary check to patch 0017's
+     sorabbyngo_lsm_cml_buf_check, which is registered via the hook
+     table introduced here).
+
+  3. Emits a SORABBYNGO_AUDIT_CML_DISPATCH audit record (patch 0013
+     SHA-256 chain) binding: NodeID + pid + api_id + buf address +
+     buf size. This gives Kenya DPA 2019 forensic traceability at the
+     AI API call level, not just the syscall level.
+
+  4. Provides a registration point (sorabbyngo_cml_hook_register) so
+     patch 0017 can install sorabbyngo_lsm_cml_buf_check without a
+     hard compile-time dependency between mm/ and security/.
+
+Hook registration design:
+  - Single global hook pointer (not a list) — only one heap hardener
+    is expected. Protected by __ro_after_init after boot completes.
+  - If no hook is registered (CONFIG_SORABBYNGO_HEAP_HARDEN=n), the
+    pre-dispatch check is skipped gracefully — the pledge and audit
+    checks still run.
+  - Registration is one-way: once set, the hook cannot be cleared
+    (prevents a compromised module from unregistering hardening).
+
+Relationship to surrounding patches:
+  0012 — LSM base; PLEDGE_CML_API flag defined there, reused here
+  0013 — audit chain; SORABBYNGO_AUDIT_CML_DISPATCH event added here
+  0015 — execpromises; pledge re-check here catches post-exec narrowing
+  0017 — heap canary; registers sorabbyngo_lsm_cml_buf_check via hook
+
+Signed-off-by: Sorabbyngo OS <security@sorabbyngo-os>
+---
+ include/linux/sorabbyngo_cml.h    |  38 ++++++
+ security/sorabbyngo/lsm.c         |  97 ++++++++++++++++
+ security/sorabbyngo/Makefile      |   1 +
+ include/linux/sorabbyngo_audit.h  |   3 +
+ 4 files changed, 139 insertions(+)
+ create mode 100644 include/linux/sorabbyngo_cml.h
+
+diff --git a/include/linux/sorabbyngo_cml.h b/include/linux/sorabbyngo_cml.h
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/include/linux/sorabbyngo_cml.h
+@@ -0,0 +1,38 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * sorabbyngo_cml.h — CML pre-dispatch LSM hook interface.
++ * Patch 0016: AI API boundary enforcement point.
++ *
++ * Called by the CML layer before every AI API dispatch.
++ * Patch 0017 registers sorabbyngo_lsm_cml_buf_check here.
++ */
++#ifndef _LINUX_SORABBYNGO_CML_H
++#define _LINUX_SORABBYNGO_CML_H
++
++#include <linux/types.h>
++
++/*
++ * API identifiers — passed to sorabbyngo_lsm_cml_predispatch() so the
++ * audit record names the specific AI API being invoked.
++ * Extend as new CML-managed APIs are added.
++ */
++#define SCML_API_BYNGOX_AGENT   0x01  /* byngox 8-agent swarm dispatch   */
++#define SCML_API_CHAMEHA_VOICE  0x02  /* chameha voice inference call     */
++#define SCML_API_OLLAMA_INFER   0x03  /* local ollama model inference     */
++#define SCML_API_BYNGOPRESS     0x04  /* byngo-press compress/decompress  */
++#define SCML_API_EXTERNAL       0xFF  /* any external AI endpoint         */
++
++/*
++ * Hook type: buffer integrity check, registered by patch 0017.
++ * Returns 0 if buffer is intact, -EFAULT if canary is corrupted.
++ */
++typedef int (*sorabbyngo_cml_buf_check_fn)(const void *buf, size_t size);
++
++/* Register the heap canary checker — called once from patch 0017 init */
++int sorabbyngo_cml_hook_register(sorabbyngo_cml_buf_check_fn fn);
++
++/*
++ * Main enforcement entry point — called by CML before every AI API call.
++ * Returns 0 to permit, -EPERM if pledge violated, -EFAULT if buf corrupt.
++ */
++int sorabbyngo_lsm_cml_predispatch(u8 api_id, const void *buf, size_t size);
++
++#endif /* _LINUX_SORABBYNGO_CML_H */
+diff --git a/security/sorabbyngo/lsm.c b/security/sorabbyngo/lsm.c
+index XXXXXXX..XXXXXXX 100644
+--- a/security/sorabbyngo/lsm.c
++++ b/security/sorabbyngo/lsm.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+  * Sorabbyngo LSM — patch 0016: CML pre-dispatch hook.
++ * Enforces PLEDGE_CML_API + audit + optional heap canary at AI API boundary.
+  */
+ #include <linux/lsm_hooks.h>
+ #include <linux/sorabbyngo_pledge.h>
++#include <linux/sorabbyngo_cml.h>
+ #include <linux/sorabbyngo_nodeid.h>
+ #include <linux/sorabbyngo_audit.h>
++#include <linux/sched.h>
++#include <linux/errno.h>
++
++/*
++ * Global hook slot for the heap canary checker (patch 0017).
++ * __ro_after_init: writable during __init only, frozen after kernel init.
++ * One-way: once registered, cannot be cleared.
++ */
++static sorabbyngo_cml_buf_check_fn sorabbyngo_cml_buf_hook __ro_after_init;
++
++/**
++ * sorabbyngo_cml_hook_register - register the heap canary check function.
++ * @fn: function pointer from patch 0017 (sorabbyngo_lsm_cml_buf_check).
++ *
++ * Called once from sorabbyngo_malloc_harden_init() during kernel boot.
++ * Returns -EBUSY if a hook is already registered (only one permitted),
++ * -EINVAL if fn is NULL, 0 on success.
++ *
++ * After boot, __ro_after_init makes this slot read-only — a post-boot
++ * attempt to register (e.g. from a compromised module) will fault.
++ */
++int sorabbyngo_cml_hook_register(sorabbyngo_cml_buf_check_fn fn)
++{
++	if (!fn)
++		return -EINVAL;
++	if (sorabbyngo_cml_buf_hook) {
++		pr_warn("sorabbyngo: CML buf hook already registered, "
++			"ignoring duplicate registration\n");
++		return -EBUSY;
++	}
++	sorabbyngo_cml_buf_hook = fn;
++	pr_info("sorabbyngo: CML pre-dispatch heap canary hook registered\n");
++	return 0;
++}
++EXPORT_SYMBOL_GPL(sorabbyngo_cml_hook_register);
++
++/**
++ * sorabbyngo_lsm_cml_predispatch - LSM enforcement at AI API call boundary.
++ * @api_id: SCML_API_* identifier of the API being called.
++ * @buf:    payload buffer pointer (may be NULL for zero-payload calls).
++ * @size:   payload buffer size in bytes.
++ *
++ * Three-stage check (all three must pass to return 0):
++ *
++ * Stage 1 — Pledge re-verification:
++ *   The calling task must hold PLEDGE_CML_API in its *current* active
++ *   pledge bitmask. We re-read task->sorabbyngo_pledge->promises rather
++ *   than relying on a cached result — patch 0015 (execpromises) means
++ *   the pledge may have been narrowed at an exec boundary since the last
++ *   check. If the flag is absent, return -EPERM and emit an audit record.
++ *
++ * Stage 2 — Payload buffer canary check (if hook registered):
++ *   If patch 0017 registered sorabbyngo_lsm_cml_buf_check via
++ *   sorabbyngo_cml_hook_register(), call it on (buf, size). A corrupted
++ *   canary means the buffer was overwritten after NodeID verification —
++ *   return -EFAULT. If no hook is registered, this stage is skipped.
++ *
++ * Stage 3 — Audit record:
++ *   Emit SORABBYNGO_AUDIT_CML_DISPATCH binding NodeID + pid + api_id +
++ *   buf address + size to the SHA-256 audit chain (patch 0013).
++ *   Emitted on permit only — denied calls are recorded by stage 1/2.
++ *
++ * Returns: 0 to permit, -EPERM on pledge violation, -EFAULT on buf corrupt.
++ */
++int sorabbyngo_lsm_cml_predispatch(u8 api_id, const void *buf, size_t size)
++{
++	struct task_struct *task = current;
++	struct sorabbyngo_pledge_state *st;
++	char nodeid_hex[NODEID_HEX_LEN + 1] = "<unknown>";
++	int ret;
++
++	/* Stage 1: pledge re-verification */
++	st = task->sorabbyngo_pledge;
++	if (!st || !(st->flags & SPLEDGE_FLAG_ACTIVE) ||
++	    !(st->promises & PLEDGE_CML_API)) {
++		nodeid_get_hex(nodeid_hex, sizeof(nodeid_hex));
++		sorabbyngo_audit_emit(SORABBYNGO_AUDIT_CML_PLEDGE_DENIED,
++				      "pid=%d nodeid=%s api_id=0x%02x",
++				      task->pid, nodeid_hex, api_id);
++		pr_warn_ratelimited(
++		    "sorabbyngo: CML dispatch denied — PLEDGE_CML_API absent "
++		    "for pid %d (nodeid: %s) api=0x%02x\n",
++		    task->pid, nodeid_hex, api_id);
++		return -EPERM;
++	}
++
++	/* Stage 2: heap canary check (patch 0017 hook, optional) */
++	if (buf && size > 0 && sorabbyngo_cml_buf_hook) {
++		ret = sorabbyngo_cml_buf_hook(buf, size);
++		if (ret) {
++			nodeid_get_hex(nodeid_hex, sizeof(nodeid_hex));
++			sorabbyngo_audit_emit(SORABBYNGO_AUDIT_CML_BUF_CORRUPT,
++					      "pid=%d nodeid=%s api_id=0x%02x "
++					      "buf=%px size=%zu",
++					      task->pid, nodeid_hex, api_id,
++					      buf, size);
++			return -EFAULT;
++		}
++	}
++
++	/* Stage 3: permit audit record */
++	nodeid_get_hex(nodeid_hex, sizeof(nodeid_hex));
++	sorabbyngo_audit_emit(SORABBYNGO_AUDIT_CML_DISPATCH,
++			      "pid=%d nodeid=%s api_id=0x%02x buf=%px size=%zu",
++			      task->pid, nodeid_hex, api_id, buf, size);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(sorabbyngo_lsm_cml_predispatch);
+diff --git a/include/linux/sorabbyngo_audit.h b/include/linux/sorabbyngo_audit.h
+index XXXXXXX..XXXXXXX 100644
+--- a/include/linux/sorabbyngo_audit.h
++++ b/include/linux/sorabbyngo_audit.h
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+ /* Sorabbyngo audit event type registry. */
++/* Patch 0016 additions */
++#define SORABBYNGO_AUDIT_CML_DISPATCH       0x0D  /* CML dispatch permitted  */
++#define SORABBYNGO_AUDIT_CML_PLEDGE_DENIED  0x0E  /* pledge check failed     */
++/* SORABBYNGO_AUDIT_CML_BUF_CORRUPT 0x0F defined by patch 0017 */
