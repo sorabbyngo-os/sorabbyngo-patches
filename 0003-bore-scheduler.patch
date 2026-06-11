@@ -1,0 +1,73 @@
+From: Sorabbyngo OS <kernel@sorabbyngo-os.dev>
+Subject: [PATCH 3/N] sched: Add BORE scheduler with Sorabbyngo profile switching
+
+BORE (Burst-Oriented Response Enhancer) scheduler patch adapted for
+Sorabbyngo OS. Adds burst score tracking per task, profile-aware
+preemption tuning, and a sysfs interface for domain mode switching.
+
+Profiles:
+  0 = balanced  (dev mode)
+  1 = latency   (security/gaming mode)
+  2 = throughput (AI inference mode)
+
+---
+ kernel/sched/bore.c          | 310 ++++++++++++++++++++++++++++++++++
+ kernel/sched/bore.h          |  62 +++++++
+ kernel/sched/fair.c          |  48 +++++-
+ kernel/sched/Makefile        |   1 +
+ kernel/sched/sched_profile.c |  98 +++++++++++
+ include/linux/sched_profile.h|  24 +++
+ 6 files changed, 543 insertions(+)
+
+diff --git a/kernel/sched/bore.h b/kernel/sched/bore.h
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/kernel/sched/bore.h
+@@ -0,0 +1,62 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * BORE — Burst-Oriented Response Enhancer
++ * Sorabbyngo OS scheduler extension
++ */
++#ifndef _SCHED_BORE_H
++#define _SCHED_BORE_H
++
++#include <linux/sched.h>
++
++/* Burst score: exponential moving average of burst time */
++#define BORE_BURST_SMOOTHNESS   2
++#define BORE_BURST_PENALTY_MAX  64
++
++/* Scheduler profiles — maps to domain modes */
++#define SCHED_PROFILE_BALANCED    0  /* dev mode    */
++#define SCHED_PROFILE_LATENCY     1  /* gaming/sec  */
++#define SCHED_PROFILE_THROUGHPUT  2  /* AI mode     */
++
++/* Per-task BORE state — embedded in task_struct via sched_entity */
++struct bore_stat {
++	u64 burst_time;       /* accumulated burst ns this slice     */
++	u64 burst_score;      /* EMA of burst_time, used for penalty */
++	u64 slice_start;      /* when current timeslice began        */
++	u8  burst_penalty;    /* 0..BORE_BURST_PENALTY_MAX           */
++};
++
++/* Global profile (set by domain-mode manager via sysfs) */
++extern int sorabbyngo_sched_profile;
++
++/* Tuning params per profile */
++struct bore_profile_params {
++	u64 min_granularity_ns;
++	u64 wakeup_granularity_ns;
++	u64 burst_penalty_scale;  /* higher = more aggressive burst penalty */
++	bool preempt_burst;       /* preempt long-burst tasks immediately   */
++};
++
++extern struct bore_profile_params bore_profiles[3];
++
++void bore_update_burst(struct sched_entity *se);
++u64  bore_calc_penalty(struct sched_entity *se);
++void bore_task_new(struct sched_entity *se);
++void bore_task_dead(struct sched_entity *se);
++
++#endif /* _SCHED_BORE_H */
